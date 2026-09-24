@@ -1,0 +1,27 @@
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.local
+.DS_Store
+
+# Expo / RN
+.expo/
+apps/mobile/android/
+apps/mobile/ios/
+*.jks
+*.keystore
+*.apk
+*.aab
+
+# Postgres (workspace-local cluster)
+.teo-pg/
+
+# Test artifacts
+coverage/
+
+# Validation evidence IS committed on purpose: docs/VALIDATION.md cites these
+# screenshots and the machine-readable E2E report. Re-running ops/e2e-app.mjs
+# overwrites them.
+artifacts/*.tmp

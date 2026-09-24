@@ -1,0 +1,30 @@
+{
+  "name": "teo-sectest",
+  "version": "1.0.0",
+  "private": true,
+  "description": "EdgeOne Security Test \u2014 internal pentest platform (React Native mobile + scalable Node execution backend)",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.6",
+    "typescript": "~5.9.2"
+  },
+  "scripts": {
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "db:migrate": "npm run db:migrate -w @teo/api",
+    "dev:api": "npm run dev -w @teo/api",
+    "dev:mobile": "npm run start -w @teo/mobile",
+    "fixture": "npm run start -w @teo/fixture",
+    "credits:topup": "npm run credits:topup -w @teo/api --",
+    "build:api": "npm run build -w @teo/api"
+  },
+  "dependencies": {
+    "expo-system-ui": "^57.0.4"
+  }
+}

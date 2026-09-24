@@ -1,0 +1,261 @@
+{
+  "results": [
+    {
+      "name": "app launches",
+      "ok": true,
+      "detail": "pid 31734"
+    },
+    {
+      "name": "login screen renders",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "access request screen opens",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "it explains that approval is required",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "request form collects name, email and password",
+      "ok": true,
+      "detail": "4 inputs"
+    },
+    {
+      "name": "login form exposes two inputs",
+      "ok": true,
+      "detail": "2 EditText nodes"
+    },
+    {
+      "name": "authenticates against the API",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "all four categories render",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Run All Tests action is present",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "DoS category lists its tests",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "config renders the target field",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "config renders HTTP method + path",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "config renders numeric params with hints",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "domain validation banner is shown when empty",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "defaults panel exposes shipped values",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "target field accepts input",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "cart reachable from the catalog",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "cart lists the queued test",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "cart shows the target",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "cart shows credit cost",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "cart exposes the request-identity control",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "identity offers neutral / browser / identify",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "identity mode is selectable",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "live run screen renders progress",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "run reaches a terminal state",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "run produced no transport errors",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "results screen shows a summary",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "results screen explains what happened in plain language",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "results screen shows iteration breakdown",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "results no longer show a credits row",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "results no longer show max severity",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "results screen exposes per-request tab",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "request log tab is reachable",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "probe rows are reachable by accessibility label",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "per-request telemetry renders",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "trace detail shows the request URL",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "trace detail shows the remote address",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "trace detail lists response headers",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "trace detail shows the status code",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "can navigate back to the tab shell",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "history lists the completed run",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "history shows the platform path",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "history explains the outcome in a sentence",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "history shows iteration detail",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "profile shows the account",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "profile exposes credits / privacy / help",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "language toggle present",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "server connection screen opens",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "connect screen explains team setup",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "connection validation returns a result",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "no fatal exceptions during the flow",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "passed": 51,
+  "failed": 0
+}
