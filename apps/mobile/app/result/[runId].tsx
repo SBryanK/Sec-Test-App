@@ -2,7 +2,6 @@ import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import type { RunRecord, Severity } from '@teo/shared';
 import { SEVERITY_RANK, getTest } from '@teo/shared';
@@ -31,7 +30,6 @@ type Tab = 'findings' | 'perTest' | 'traces';
 export default function ResultScreen(): React.JSX.Element {
   const { runId } = useLocalSearchParams<{ runId: string }>();
   const router = useRouter();
-  const insets = useSafeAreaInsets();
   const { t } = useI18n();
 
   const [run, setRun] = useState<RunRecord | null>(null);
@@ -554,7 +552,6 @@ function plainSummary(tests: TestSummary[], findingCount: number): PlainLine[] {
  * about a third of the way in" visible at a glance.
  */
 function IterationBar({ test }: { test: TestSummary }): React.JSX.Element {
-  const total = Math.max(1, test.probes);
   const segments: Array<{ count: number; color: string; label: string }> = [
     { count: test.passed, color: palette.primary, label: 'passed' },
     { count: test.blocked, color: palette.success, label: 'blocked' },

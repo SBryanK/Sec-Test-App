@@ -283,6 +283,28 @@ function SelectField({
  * Field renderer
  * ------------------------------------------------------------------ */
 
+/**
+ * Render any config value as display text.
+ *
+ * A field's value can be a string, number, boolean, string list or Key/Value
+ * rows. `String(value)` on the last two yields `"[object Object]"`, so an
+ * imported config with an unexpected shape would render as garbage rather than
+ * something an operator can act on.
+ */
+function displayValue(value: FieldValue | undefined): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return '';
+    if (typeof value[0] === 'string') return (value as string[]).join('\n');
+    return (value as KvPair[])
+      .map((pair) => (pair.key ? `${pair.key}: ${pair.value}` : pair.value))
+      .join('\n');
+  }
+  return '';
+}
+
 export interface FieldRendererProps {
   field: FieldDef;
   value: FieldValue | undefined;
@@ -341,7 +363,7 @@ export function FieldRenderer({
       return (
         <OutlinedInput
           label={field.label}
-          value={String(value ?? '')}
+          value={displayValue(value)}
           onChangeText={(v) => onChange(field.id, v)}
           placeholder={field.placeholder}
           hint={field.hint}
@@ -354,7 +376,7 @@ export function FieldRenderer({
       return (
         <OutlinedInput
           label={field.label}
-          value={String(value ?? '')}
+          value={displayValue(value)}
           onChangeText={(v) => onChange(field.id, v)}
           placeholder={field.placeholder}
           hint={field.hint}
@@ -369,7 +391,7 @@ export function FieldRenderer({
       return (
         <OutlinedInput
           label={field.label}
-          value={Array.isArray(value) ? (value as string[]).join('\n') : String(value ?? '')}
+          value={displayValue(value)}
           onChangeText={(v) => onChange(field.id, v.split('\n').filter((line) => line.trim().length > 0))}
           hint={field.hint ?? 'One per line'}
           multiline
@@ -380,7 +402,7 @@ export function FieldRenderer({
       );
 
     case 'number': {
-      const numeric = value === '' || value === null || value === undefined ? '' : String(value);
+      const numeric = value === '' || value === null || value === undefined ? '' : displayValue(value);
       const outOfRange =
         numeric !== '' &&
         ((field.min !== undefined && Number(numeric) < field.min) ||
@@ -469,7 +491,7 @@ export function FieldRenderer({
             </Text>
             {field.options && field.options.length > 0 ? (
               <Text variant="micro" tone="primary" style={styles.segmentedValue}>
-                {(field.options.find((o) => o.value === value)?.label ?? String(value ?? '')).toUpperCase()}
+                {(field.options.find((o) => o.value === value)?.label ?? displayValue(value)).toUpperCase()}
               </Text>
             ) : null}
           </View>
@@ -508,7 +530,7 @@ export function FieldRenderer({
       return (
         <SelectField
           label={field.label}
-          value={String(value ?? field.options?.[0]?.value ?? '')}
+          value={displayValue(value) || field.options?.[0]?.value || ''}
           options={field.options ?? []}
           onChange={(v) => onChange(field.id, v)}
           surface={surface}
@@ -535,7 +557,7 @@ export function FieldRenderer({
       // have drifted. Fail loudly in development rather than rendering nothing.
       if (__DEV__) {
         throw new Error(
-          `FieldRenderer has no case for field type "${field.type}" (field "${field.id}"). ` +
+          `FieldRenderer has no case for field type "${String(field.type)}" (field "${field.id}"). ` +
             'Add it to SUPPORTED_FIELD_TYPES and implement the control.',
         );
       }

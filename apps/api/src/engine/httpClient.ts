@@ -11,6 +11,9 @@ const { gunzipSync, inflateSync, inflateRawSync, brotliDecompressSync } = zlib;
 
 import type { HttpMethod, TimingBreakdown } from '@teo/shared';
 
+/** Redirect hops followed before giving up. */
+export const MAX_REDIRECTS = 5;
+
 /** Bytes of a body/response retained for evidence. */
 export const PREVIEW_BYTES = 2048;
 
@@ -127,11 +130,17 @@ function headersToObject(rawHeaders: string[] | undefined): Record<string, strin
 /** `getPeerCertificate()` types some fields as `string | string[]`; normalise. */
 function asString(value: unknown): string | null {
   if (value === null || value === undefined) return null;
-  if (Array.isArray(value)) return value.join(', ');
-  return String(value);
+  if (Array.isArray(value)) return value.map((v) => asString(v)).filter(Boolean).join(', ');
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    return String(value);
+  }
+  // Anything else would stringify to "[object Object]"; report nothing instead.
+  return null;
 }
 
-function summariseCertificate(socket: tls.TLSSocket): TlsInfo | null {  const cert = socket.getPeerCertificate();
+function summariseCertificate(socket: tls.TLSSocket): TlsInfo | null {
+  const cert = socket.getPeerCertificate();
   if (!cert || Object.keys(cert).length === 0) return null;
   const validTo = cert.valid_to ? new Date(cert.valid_to) : null;
   const daysUntilExpiry =
@@ -172,7 +181,11 @@ const emptyTiming = (): TimingBreakdown => ({
  * Never throws for network-level failures: transport errors come back on
  * `result.error` so the caller can record an `error` verdict with full timing.
  */
-export async function probe(options: ProbeOptions): Promise<ProbeResult> {
+export async function probe(
+  options: ProbeOptions,
+  /** Internal: redirect hops already followed. Never set by callers. */
+  hops = 0,
+): Promise<ProbeResult> {
   const {
     url,
     method,
@@ -288,17 +301,21 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult> {
         path: `${parsed.pathname}${parsed.search}`,
         method,
         headers: requestHeaders,
-        agent: agent === undefined ? false : agent,
+        // `agent: false` (not undefined) means Node builds a default Agent,
+        // which silently overrides `createConnection` — so the CONNECT tunnel
+        // below was never used and HTTPS went direct. Only force a fresh
+        // connection when we are NOT tunnelling.
+        agent: proxy ? undefined : agent === undefined ? false : agent,
         rejectUnauthorized: verifyTls,
         // Time DNS ourselves so the breakdown is exact.
         lookup: (hostname, lookupOptions, callback) => {
           const started = performance.now();
-          dns.lookup(hostname, lookupOptions as dns.LookupOptions, (err, address, family) => {
+          dns.lookup(hostname, lookupOptions, (err, address, family) => {
             dnsMs = performance.now() - started;
             (callback as (e: NodeJS.ErrnoException | null, a: string, f: number) => void)(
               err,
               address as string,
-              family as number,
+              family,
             );
           });
         },
@@ -306,14 +323,13 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult> {
 
       if (proxy) {
         result.viaProxy = true;
-        if (proxy.authHeader) {
-          connection.headers = {
-            ...(connection.headers as Record<string, string>),
-            'Proxy-Authorization': proxy.authHeader,
-          };
-        }
         if (isHttps) {
           // Tunnel: connect to the proxy but keep the target as the logical host.
+          //
+          // Credentials go on the CONNECT request inside the tunnel factory.
+          // They must NOT be added to `connection.headers`, which are sent to
+          // the *target* — doing so leaked the proxy password to every site we
+          // tested.
           connection.createConnection = tunnelFactory(
             proxy,
             parsed.hostname,
@@ -322,10 +338,18 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult> {
             timeoutMs,
           ) as unknown as http.RequestOptions['createConnection'];
         } else {
-          // Plain HTTP through a proxy uses the absolute-form request target.
+          // Plain HTTP through a proxy uses the absolute-form request target,
+          // and here we really are talking to the proxy, so its credentials
+          // belong in the request headers.
           connection.hostname = proxy.host;
           connection.port = proxy.port;
           connection.path = url;
+          if (proxy.authHeader) {
+            connection.headers = {
+              ...(connection.headers as Record<string, string>),
+              'Proxy-Authorization': proxy.authHeader,
+            };
+          }
         }
       }
 
@@ -381,7 +405,25 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult> {
               rawCollected += slice.byteLength;
             }
             if (received > maxBodyBytes) {
+              // Resolve with what we have rather than destroying silently.
+              // Destroying emitted neither 'end' nor 'error', so this promise
+              // never settled and the whole run hung — and because the socket
+              // was gone, `req.setTimeout` could not rescue it either.
               res.destroy();
+              finish(() =>
+                resolve({
+                  statusCode,
+                  statusMessage,
+                  rawHeaders,
+                  body: decodeBody(Buffer.concat(rawChunks), null).body,
+                  encoding: null,
+                  truncated: true,
+                  cert:
+                    isHttps && res.socket instanceof tls.TLSSocket
+                      ? summariseCertificate(res.socket)
+                      : null,
+                }),
+              );
             }
           });
 
@@ -407,11 +449,32 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult> {
           });
 
           res.on('error', (err) => finish(() => reject(err)));
+
+          // Backstop: if the response is torn down for any reason without
+          // 'end' or 'error', settle rather than leaving the caller waiting.
+          res.on('close', () => {
+            if (settled) return;
+            if (firstBodyByteAt !== null) {
+              finish(() =>
+                resolve({
+                  statusCode,
+                  statusMessage,
+                  rawHeaders,
+                  body: decodeBody(Buffer.concat(rawChunks), null).body,
+                  encoding: null,
+                  truncated: true,
+                  cert: null,
+                }),
+              );
+            } else {
+              finish(() => reject(new Error('Connection closed before a response was received')));
+            }
+          });
         },
       );
 
       req.on('socket', (socket) => {
-        if ((socket as net.Socket).connecting === false) return; // reused socket
+        if ((socket).connecting === false) return; // reused socket
         socket.once('connect', () => {
           tcpMs = performance.now() - (dnsMs !== null ? t0 + dnsMs : t0);
         });
@@ -467,11 +530,19 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult> {
     };
   } catch (err) {
     // Follow redirects manually so each hop is its own trace row.
+    //
+    // `hops` is threaded through the recursion. Reading the chain length off
+    // this frame always gave 1, so a redirect cycle (`/x` -> `/login` -> `/x`)
+    // recursed until the target gave up, hammering it indefinitely.
     const redirectTo = (err as { redirectTo?: string }).redirectTo;
-    if (redirectTo && result.redirectChain.length < 5) {
+    if (redirectTo && hops < MAX_REDIRECTS) {
       try {
         const next = new URL(redirectTo, url).toString();
-        const followed = await probe({ ...options, url: next, method: 'GET', body: null });
+        if (result.redirectChain.includes(next)) {
+          result.error = `Redirect loop detected at ${next}`;
+          return result;
+        }
+        const followed = await probe({ ...options, url: next, method: 'GET', body: null }, hops + 1);
         return {
           ...followed,
           redirectChain: [...result.redirectChain, ...followed.redirectChain],
@@ -835,34 +906,50 @@ export function openConnection(
       let buf = '';
       let bytesRead = 0;
       let done = false;
+      // The timeout used to be created and then left running, so every flood
+      // connection kept a live timer for the full `timeoutMs` after it had
+      // already answered — thousands of pending timers on a big run. It is
+      // cleared on every completion path instead.
+      let timer: NodeJS.Timeout | null = null;
+
+      const cleanup = (): void => {
+        if (timer !== null) clearTimeout(timer);
+        socket.off('data', onData);
+        socket.off('error', onGone);
+        socket.off('close', onGone);
+      };
+
+      const finish = (statusCode: number | null): void => {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve({ statusCode, bytesRead });
+      };
 
       const onData = (chunk: Buffer): void => {
         bytesRead += chunk.byteLength;
         buf += chunk.toString('latin1');
         const match = /^HTTP\/1\.[01] (\d{3})/.exec(buf);
-        if (match && !done) {
-          done = true;
-          socket.off('data', onData);
-          resolve({ statusCode: Number(match[1]), bytesRead });
-        }
-        if (buf.length > 64 * 1024) {
-          done = true;
-          socket.off('data', onData);
-          resolve({ statusCode: null, bytesRead });
+        if (match) {
+          finish(Number(match[1]));
+        } else if (buf.length > 64 * 1024) {
+          finish(null);
         }
       };
 
+      // A socket error or close before the status line arrives would otherwise
+      // leave this promise pending until the timeout fired.
+      const onGone = (): void => finish(null);
+
       socket.on('data', onData);
+      socket.once('error', onGone);
+      socket.once('close', onGone);
+
       socket.write(
         `${statusLine}\r\nHost: ${host}\r\nConnection: keep-alive\r\nUser-Agent: ${userAgent}\r\nAccept: */*\r\n\r\n`,
       );
 
-      setTimeout(() => {
-        if (done) return;
-        done = true;
-        socket.off('data', onData);
-        resolve({ statusCode: null, bytesRead });
-      }, timeoutMs);
+      timer = setTimeout(() => finish(null), timeoutMs);
     });
   };
 

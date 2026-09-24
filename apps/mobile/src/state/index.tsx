@@ -18,10 +18,11 @@ import type {
 } from '@teo/shared';
 import { buildAllTestsConfigs, buildDefaultConfig, totalCreditCost } from '@teo/shared';
 
-import { api, loadBaseUrl, loadSession, saveSession, setBaseUrl } from '../api/client';
+import { ApiError, api, loadBaseUrl, loadSession, saveSession, setBaseUrl } from '../api/client';
 
 const CART_KEY = 'teo.cart';
 const ANONYMITY_KEY = 'teo.anonymity';
+const EGRESS_KEY = 'teo.egressProxy';
 
 /* ------------------------------------------------------------------ *
  * Auth
@@ -49,10 +50,19 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
       if (session) {
         try {
           setUser(await api.me());
-        } catch {
-          // Token expired or the server moved — fall back to the login screen.
-          await saveSession(null);
-          setUser(null);
+        } catch (err) {
+          // Only discard the stored token when the server actually rejected it.
+          //
+          // This used to clear on ANY failure, so launching the app while the
+          // server was unreachable (laptop asleep, different Wi-Fi, a proxy
+          // answering 502) deleted a perfectly valid token from the Keychain
+          // and forced a re-login. `ApiError.status` is 0 for a transport
+          // failure and 401/403 only when the credential is genuinely dead.
+          const status = err instanceof ApiError ? err.status : 0;
+          if (status === 401 || status === 403) {
+            await saveSession(null);
+            setUser(null);
+          }
         }
       }
       setReady(true);
@@ -206,6 +216,11 @@ export function CartProvider({ children }: { children: ReactNode }): React.JSX.E
         if (mode === 'identify' || mode === 'neutral' || mode === 'browser') {
           setAnonymityState(mode);
         }
+        // Restore the proxy too. Without this the Identity card reported "no
+        // proxy" after a restart while the restored cart items still carried
+        // one — so the UI and the traffic disagreed about what the target saw.
+        const proxy = await AsyncStorage.getItem(EGRESS_KEY);
+        if (proxy) setEgressProxyState(proxy);
       } catch {
         /* start with an empty cart */
       }
@@ -236,6 +251,9 @@ export function CartProvider({ children }: { children: ReactNode }): React.JSX.E
   const setEgressProxy = useCallback((proxy: string | null) => {
     const cleaned = proxy && proxy.trim() ? proxy.trim() : null;
     setEgressProxyState(cleaned);
+    void (cleaned
+      ? AsyncStorage.setItem(EGRESS_KEY, cleaned)
+      : AsyncStorage.removeItem(EGRESS_KEY));
     setConfigs((prev) => {
       const next = prev.map((c) => ({ ...c, options: { ...c.options, egressProxy: cleaned } }));
       void AsyncStorage.setItem(CART_KEY, JSON.stringify(next));
@@ -243,13 +261,11 @@ export function CartProvider({ children }: { children: ReactNode }): React.JSX.E
     });
   }, []);
 
-  const persist = useCallback((next: AttackConfig[]) => {
-    setConfigs(next);
-    void AsyncStorage.setItem(CART_KEY, JSON.stringify(next));
-  }, []);
-
   const add = useCallback(
     (config: AttackConfig) => {
+      // Depends on applyIdentity: without it this closed over the identity
+      // settings from the first render, so a test added after switching to
+      // Browser mode would silently be queued as Neutral.
       const withIdentity = applyIdentity(config);
       setConfigs((prev) => {
         const next = [...prev, withIdentity];
@@ -257,7 +273,7 @@ export function CartProvider({ children }: { children: ReactNode }): React.JSX.E
         return next;
       });
     },
-    [],
+    [applyIdentity],
   );
 
   const addDefaults = useCallback(

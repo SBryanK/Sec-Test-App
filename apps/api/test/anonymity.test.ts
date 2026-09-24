@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { before, describe, it } from 'node:test';
 
-import type { AttackConfig, NormalisedTarget, TestId } from '@teo/shared';
+import type { AttackConfig, TestId } from '@teo/shared';
 import { DEFAULT_EXECUTION_OPTIONS, buildDefaultConfig, normaliseTarget } from '@teo/shared';
 
 import {
@@ -250,9 +250,10 @@ async function runTest(testId: TestId, tweak: (c: AttackConfig) => void = () => 
   tweak(config);
 
   const traces: TraceDraft[] = [];
+  let seqCounter = 0;
   const ctx: ExecutorContext = {
     config,
-    target: normaliseTarget(FIXTURE_VULNERABLE) as NormalisedTarget,
+    target: normaliseTarget(FIXTURE_VULNERABLE),
     identity: { email: OPERATOR_EMAIL, name: OPERATOR_NAME },
     emit: async (draft) => {
       traces.push(draft);
@@ -262,6 +263,10 @@ async function runTest(testId: TestId, tweak: (c: AttackConfig) => void = () => 
     log: () => undefined,
     plannedProbes: planProbes(config),
     rotation: { previous: null },
+    allocateSeq: () => {
+      seqCounter += 1;
+      return seqCounter;
+    },
   };
 
   await executorFor(testId)(ctx);
@@ -364,7 +369,7 @@ describe('wire-level anonymity', () => {
     // anonymity layer must not silently override the operator's intent.
     const config = buildDefaultConfig('user_agent_anomaly', FIXTURE_VULNERABLE);
     config.options.anonymity = 'browser';
-    const target = normaliseTarget(FIXTURE_VULNERABLE) as NormalisedTarget;
+    const target = normaliseTarget(FIXTURE_VULNERABLE);
 
     const built = buildRequest(config, target, null, {
       identity: { email: OPERATOR_EMAIL, name: OPERATOR_NAME },

@@ -8,7 +8,7 @@ import {
   type ViewStyle,
 } from 'react-native';
 
-import { font, palette, radius, spacing } from '../theme';
+import { font, palette, spacing } from '../theme';
 import { Text } from './ui';
 
 export interface SliderProps {

@@ -92,29 +92,70 @@ const results = [];
  * adb helpers
  * ------------------------------------------------------------------ */
 
+/**
+ * Run an adb command.
+ *
+ * The timeout is not optional. `uiautomator dump` and `exec-out screencap` both
+ * block indefinitely when the device surface is busy — a window animation, a
+ * modal, or a stale uiautomator process — and without a timeout the harness sat
+ * there producing no output at all, which reads as "the app is broken" rather
+ * than "the driver is wedged".
+ */
+const ADB_TIMEOUT_MS = 25_000;
+
 function adb(...args) {
-  return execFileSync(ADB, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: ADB_ENV });
+  return execFileSync(ADB, args, {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    env: ADB_ENV,
+    timeout: ADB_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+  });
 }
 
 function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+  // Braced body: an arrow returning `setTimeout(...)` hands the timer handle
+  // back to the promise machinery, which cannot read it.
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function shot(name) {
   step += 1;
   const file = join(SHOTS, `${String(step).padStart(2, '0')}-${name}.png`);
-  const buf = execFileSync(ADB, ['exec-out', 'screencap', '-p'], {
-    maxBuffer: 64 * 1024 * 1024,
-    env: ADB_ENV,
-  });
-  writeFileSync(file, buf);
+  try {
+    const buf = execFileSync(ADB, ['exec-out', 'screencap', '-p'], {
+      maxBuffer: 64 * 1024 * 1024,
+      env: ADB_ENV,
+      timeout: ADB_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
+    writeFileSync(file, buf);
+  } catch (err) {
+    // Evidence is valuable but never worth failing a functional check over.
+    console.log(`  \u001b[33m!\u001b[0m screenshot "${name}" unavailable: ${err.message.split('\n')[0]}`);
+  }
   return file;
 }
 
 /** Dump the view hierarchy and parse it into addressable nodes. */
 function uiNodes() {
-  adb('shell', 'uiautomator', 'dump', '/sdcard/ui.xml');
-  const xml = adb('shell', 'cat', '/sdcard/ui.xml');
+  // Retried once: a dump started while the UI is animating returns a truncated
+  // tree, and a single retry is far cheaper than a misleading assertion.
+  let xml = '';
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      adb('shell', 'uiautomator', 'dump', '/sdcard/ui.xml');
+      xml = adb('shell', 'cat', '/sdcard/ui.xml');
+      if (xml.includes('<hierarchy')) break;
+    } catch (err) {
+      if (attempt === 1) {
+        throw new Error(`Could not read the view hierarchy: ${err.message}`);
+      }
+      execFileSync(ADB, ['shell', 'rm', '-f', '/sdcard/ui.xml'], { env: ADB_ENV, timeout: ADB_TIMEOUT_MS });
+    }
+  }
   const nodes = [];
   const re = /<node\b([^>]*?)\/?>/g;
   let m;
@@ -168,14 +209,31 @@ function editFields() {
   return uiNodes().filter((n) => /EditText/i.test(n.cls));
 }
 
-async function waitFor(needle, timeoutMs = 15000, opts) {
+/**
+ * Poll the accessibility tree until `needle` appears.
+ *
+ * The one-shot `findByText` read races the UI: the screenshot can be captured
+ * before the screen has laid out, which turns a working app into a failing
+ * check. Prefer this for anything asserted after a navigation.
+ */
+async function waitForOptional(needle, timeoutMs = 15000, opts) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const node = findByText(needle, opts);
-    if (node) return node;
+  let lastError = null;
+  for (;;) {
+    try {
+      const node = findByText(needle, opts);
+      if (node) return node;
+      lastError = null;
+    } catch (err) {
+      // Keep polling: a transient dump failure is not evidence of absence.
+      lastError = err;
+    }
+    if (Date.now() >= deadline) {
+      if (lastError) throw lastError;
+      return null;
+    }
     await sleep(400);
   }
-  throw new Error(`Timed out waiting for "${needle}"`);
 }
 
 /**
@@ -205,13 +263,6 @@ async function tryTapControl(label, opts = {}) {
   } catch {
     return null;
   }
-}
-
-async function tapText(needle, opts) {
-  const node = await waitFor(needle, 15000, opts);
-  adb('shell', 'input', 'tap', String(node.x), String(node.y));
-  await sleep(900);
-  return node;
 }
 
 /** Replace the contents of a native text field. */
@@ -302,6 +353,13 @@ function screenText() {
   return uiNodes().map((n) => `${n.text} ${n.desc}`).join(' ');
 }
 
+let currentStep = 'startup';
+
+function step_(name) {
+  currentStep = name;
+  console.log(`  \u001b[2m… ${name}\u001b[0m`);
+}
+
 function check(name, ok, detail = '') {
   results.push({ name, ok, detail });
   console.log(`  ${ok ? '\u001b[32m✔\u001b[0m' : '\u001b[31m✖\u001b[0m'} ${name}${detail ? ` — ${detail}` : ''}`);
@@ -313,12 +371,14 @@ function check(name, ok, detail = '') {
 
 async function main() {
   console.log('\n\u001b[1m── Android app E2E ──\u001b[0m');
+  step_('app launch');
 
   // Fresh install state so the splash and login are genuinely exercised.
   adb('shell', 'pm', 'clear', PKG);
   await sleep(1500);
 
   /* ---- splash ---- */
+  step_('splash');
   adb('shell', 'am', 'start', '-n', `${PKG}/.MainActivity`);
   await sleep(400);
   shot('splash');
@@ -329,10 +389,12 @@ async function main() {
   shot('login');
 
   /* ---- login ---- */
-  const loginVisible = await findByText('sign in');
+  step_('login');
+  const loginVisible = await waitForOptional('sign in', 10000);
   check('login screen renders', !!loginVisible);
 
   /* ---- Access request screen (the golden gate) ---- */
+  step_('access request screen');
   // Located by accessibility label, not the visible copy.
   const requestLink = await tryTapControl('Request access', { timeoutMs: 6000 });
   if (requestLink) {
@@ -368,16 +430,18 @@ async function main() {
   await sleep(7000);
   shot('after-login');
 
-  const signedIn = (await findByText('security tests')) ?? (await findByText('validate connection'));
+  const signedIn =
+    (await waitForOptional('security tests', 12000)) ?? (await waitForOptional('validate connection', 4000));
   check('authenticates against the API', !!signedIn);
   if (!signedIn) {
-    const err = (await findByText('fetch failed')) ?? (await findByText('invalid'));
+    const err = (await waitForOptional('fetch failed', 1500)) ?? findByText('invalid');
     check('no auth error shown', !err, err ? 'error banner present' : '');
     finish();
     return;
   }
 
   /* ---- Test tab: catalog ---- */
+  step_('catalog');
   await tapControl('Test', { exact: true });
   await sleep(2500);
   shot('test-catalog');
@@ -393,6 +457,7 @@ async function main() {
   shot('run-all-visible');
 
   /* ---- Config screen (schema-driven) ---- */
+  step_('config screen');
   await tapControl('dos protection');
   await sleep(2000);
   shot('select-test-type');
@@ -418,6 +483,7 @@ async function main() {
   check('domain validation banner is shown when empty', /domain cannot be empty/i.test(configBlob));
 
   /* ---- Defaults overlay ---- */
+  step_('defaults overlay');
   await tryTapControl('defaults');
   await sleep(1200);
   shot('config-defaults');
@@ -427,6 +493,7 @@ async function main() {
   await sleep(800);
 
   /* ---- Fill a target and add to cart ---- */
+  step_('add to cart');
   // Field 0 on this screen is the target domain input.
   const filled = await fillField(0, SCAN_TARGET);
   check('target field accepts input', filled);
@@ -437,6 +504,7 @@ async function main() {
   shot('after-add-to-cart');
 
   /* ---- Cart ---- */
+  step_('cart');
   const openedCart = await tryTapControl('Cart', { exact: false });
   await sleep(2000);
   shot('cart');
@@ -466,6 +534,7 @@ async function main() {
   await sleep(700);
 
   /* ---- Launch the run ---- */
+  step_('launch run');
   const confirmBtn = await tryTapControl('confirm');
   if (confirmBtn) {
     await sleep(3000);
@@ -490,6 +559,7 @@ async function main() {
   }
 
   /* ---- Results ---- */
+  step_('results');
   const viewResults = await tryTapControl('View results', { timeoutMs: 25000 });
   if (viewResults) {
     await sleep(3000);
@@ -550,11 +620,13 @@ async function main() {
   }
 
   /* ---- Back to the tab shell (Results is a full-screen route) ---- */
+  step_('return to tabs');
   const backOnTabs = await returnToTabs();
   check('can navigate back to the tab shell', backOnTabs);
   await sleep(1000);
 
   /* ---- History ---- */
+  step_('history');
   await tryTapControl('History', { exact: true });
   await sleep(3000);
   shot('history');
@@ -578,13 +650,19 @@ async function main() {
   }
 
   /* ---- Profile ---- */
+  step_('profile');
   await tryTapControl('Profile', { exact: true });
   await sleep(2500);
   shot('profile');
   const profile = screenText();
+  // The signed-in address is read from the environment, not hardcoded: an
+  // operator's personal email does not belong in a checked-in assertion, and a
+  // different seed account would otherwise fail a test that is actually passing.
   check(
     'profile shows the account',
-    /profile/i.test(profile) && /santasila\.bryan@gmail\.com/i.test(profile),
+    /profile/i.test(profile) &&
+      profile.toLowerCase().includes(SEED_EMAIL.trim().toLowerCase()),
+    `expected "${SEED_EMAIL}" on screen`,
   );
   check(
     'profile exposes credits / privacy / help',
@@ -593,6 +671,7 @@ async function main() {
   check('language toggle present', /EN/.test(profile) && /中文/.test(profile));
 
   /* ---- Server connection screen (team onboarding) ---- */
+  step_('server settings');
   // Profile grows as features are added; scroll so the server section is
   // actually on screen before looking for its control.
   await scrollDown(2);
@@ -609,6 +688,7 @@ async function main() {
   await sleep(800);
 
   /* ---- Search tab ---- */
+  step_('search tab');
   await tryTapControl('Search', { exact: true });
   await sleep(2500);
   shot('search');
@@ -621,6 +701,7 @@ async function main() {
   check('connection validation returns a result', /reachable|unreachable/i.test(search));
 
   /* ---- No crashes anywhere ---- */
+  step_('crash sweep');
   const logs = adb('logcat', '-d', '-t', '600');
   const fatal = logs.split('\n').filter((l) => /FATAL EXCEPTION/.test(l));
   check('no fatal exceptions during the flow', fatal.length === 0, fatal[0]?.slice(0, 120) ?? '');
@@ -637,7 +718,7 @@ function finish() {
 }
 
 main().catch((err) => {
-  console.error('\nE2E driver error:', err.message);
+  console.error(`\nE2E driver error while "${currentStep}":`, err.message);
   try {
     shot('failure');
   } catch {

@@ -1,4 +1,3 @@
-import { probe } from '../httpClient.ts';
 import {
   analyseReplays,
   classifyGeneric,
@@ -9,7 +8,7 @@ import {
   detectSchemaGap,
   type Detection,
 } from '../detectors.ts';
-import { bool, buildRequest, list, num, str, type BuiltRequest } from '../requestBuilder.ts';
+import { bool, list, num, str, type BuiltRequest } from '../requestBuilder.ts';
 import {
   buildFor,
   probeWith,
@@ -169,7 +168,8 @@ export const idorExecutor: Executor = async (ctx): Promise<ExecutorOutcome> => {
   const nextSeq = makeSeqFactory(ctx);
 
   const ids: number[] = [];
-  for (let id = start; step > 0 && id <= end && ids.length < ctx.budget.maxRequests; id += step) {
+  // `step` is Math.max(1, …) above, so a `step > 0` guard here was dead code.
+  for (let id = start; id <= end && ids.length < ctx.budget.maxRequests; id += step) {
     ids.push(id);
   }
 
@@ -394,8 +394,9 @@ export const businessLogicExecutor: Executor = async (ctx): Promise<ExecutorOutc
   ctx.log(`Replaying request ${replayCount}× ${concurrent ? 'concurrently' : `with ${delayMs}ms spacing`}`);
 
   const built = buildFor(ctx, null);
+  // Through probeWith, so the run's egress proxy applies here too.
   const send = () =>
-    probe({
+    probeWith(ctx, {
       url: built.url,
       method: built.method,
       headers: built.headers,

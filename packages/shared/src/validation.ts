@@ -38,7 +38,7 @@ export function defaultValues(test: TestDefinition): ConfigValues {
   const values: ConfigValues = {};
   for (const field of test.fields) {
     if (field.type === 'note' || field.type === 'section' || field.type === 'divider') continue;
-    values[field.id] = (field.default ?? emptyForField(field)) as FieldValue;
+    values[field.id] = (field.default ?? emptyForField(field));
   }
   return values;
 }
@@ -292,6 +292,43 @@ export function validateField(field: FieldDef, value: FieldValue | undefined): V
 export function validateConfig(config: AttackConfig): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const test = getTest(config.testId);
+
+  // Structural checks first. The API is a public surface: a hand-rolled POST
+  // can omit `http` or `query` entirely, and without this the engine crashed
+  // deep inside the request builder with
+  // "Cannot read properties of undefined (reading 'query')" — after the run had
+  // been queued, charged, and reported as failed for no actionable reason.
+  const http = config.http as Partial<AttackConfig['http']> | undefined;
+  const structural: Array<[keyof AttackConfig['http'], string]> = [
+    ['query', 'Query parameters'],
+    ['headers', 'Headers'],
+  ];
+  for (const [key, label] of structural) {
+    if (http !== undefined && http !== null && !Array.isArray(http[key])) {
+      issues.push({
+        fieldId: `http.${String(key)}`,
+        label,
+        message: `${label} must be a list`,
+        severity: 'error',
+      });
+    }
+  }
+  if (http === undefined || http === null) {
+    issues.push({
+      fieldId: 'http',
+      label: 'HTTP block',
+      message: 'The request definition is missing — rebuild this configuration from the catalog',
+      severity: 'error',
+    });
+  }
+  if ((config.target as Partial<AttackConfig['target']> | undefined) === undefined) {
+    issues.push({
+      fieldId: 'target',
+      label: 'Target',
+      message: 'The target block is missing',
+      severity: 'error',
+    });
+  }
 
   const domain = config.target.domain?.trim() ?? '';
   if (!domain) {

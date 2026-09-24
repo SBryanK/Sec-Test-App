@@ -57,7 +57,7 @@ async function signIn(email: string, password: string): Promise<{ status: number
     body: { email, password },
     token: null,
   });
-  return { status: res.status, token: res.body?.token ?? '', body: res.body as Record<string, unknown> };
+  return { status: res.status, token: res.body?.token ?? '', body: res.body };
 }
 
 /** Every route that must honour status and revocation. */

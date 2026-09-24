@@ -20,14 +20,33 @@ node ops/e2e-app.mjs   # 30-check flow through the installed APK on an emulator
 | Platform fingerprinting | `apps/api/test/fingerprint.test.ts` | **16 / 16 pass** |
 | Engine end-to-end | `apps/api/test/engine.e2e.test.ts` | **22 / 22 pass** |
 | Catalog + validation | `packages/shared/test/catalog.test.ts` | **28 / 28 pass** |
-| API integration | `apps/api/test/api.integration.test.ts` | **29 / 29 pass** |
+| API integration | `apps/api/test/api.integration.test.ts` | **30 / 30 pass** |
 | Operator anonymity | `apps/api/test/anonymity.test.ts` | **34 / 34 pass** |
 | Access control | `apps/api/test/access-control.test.ts` | **20 / 20 pass** |
+| Load concurrency primitives | `apps/api/test/concurrency.test.ts` | **18 / 18 pass** |
 | Mobile UI contract | `apps/mobile/test/ui-contract.test.ts` | **16 / 16 pass** |
-| **Total** | | **218 / 218 pass** |
+| Mobile API client | `apps/mobile/test/api-client.test.ts` | **23 / 23 pass** |
+| **Total** | | **259 / 259 pass** |
 
-Typecheck is clean across all five workspaces. `ops/verify.sh` additionally
-builds the production bundle and asserts it stays up and serves a request.
+Typecheck is clean across all workspaces. `ops/verify.sh` additionally builds the
+production bundle and asserts it stays up and serves a request.
+
+### Live behavioural checks (`ops/check-live.ts`)
+
+Unit tests can only assert what a function returned. The checks below assert
+what the **target observed** and what the **ledger recorded**, against the
+running stack — the things a mock cannot lie about. They run as part of
+`ops/verify.sh` and currently pass **33 / 33**:
+
+| Check | What it proves |
+|---|---|
+| Spike rate ceiling | A config asking for 2000 rps is capped at the server's 30 rps limit, the cap is reported in metrics, and the **achieved** rate is 30 rps |
+| Flood pacing | 10 connections at 40 rps produce 40 rps **in total**, not 400 |
+| Evidence fidelity | The `User-Agent` in every trace equals the one the fixture actually received, compared header-for-header |
+| Anonymity honesty | A pinned `User-Agent` yields no rotation and the trace does not claim any; removing it yields 4–5 distinct profiles across 9 requests |
+| Identity containment | No trace of the operator's name or address appears in any header the fixture received |
+| Charges follow traffic | A rejected submission costs nothing; completed runs are charged |
+| Top-up flow | A request reaches the admin queue, a grant closes it, the balance moves by exactly the granted amount, and the record stays auditable |
 
 ### Why the engine tests are trustworthy
 
@@ -113,6 +132,8 @@ Release APK built with Gradle 9.3.1 against Android SDK 35, installed on an
 | 50 | History shows iteration detail | ✅ |
 | 51 | No fatal exceptions during the flow | ✅ |
 
+**51 / 51** — re-verified against the release APK built from the corrected source.
+
 ### Recorded run from the device
 
 A default HTTP Spike (500 requests, 20 threads, 50 ms interval) launched from
@@ -133,6 +154,34 @@ Findings              0
 
 Every one of the 500 probes was persisted and is individually inspectable in the
 Requests tab with its own DNS/TCP/TLS/first-byte/byte-count breakdown.
+
+**That 360.75 req/s figure is itself the measurement of a bug.** The defaults ask
+for 20 threads at a 50 ms interval, and the run reported the result without ever
+comparing it to what was configured: the real dispatch rate was
+`threads × 1000/interval` = **400 rps**, four hundred times the 20 rps an operator
+would read from the form. The per-test metrics now record both the requested and
+the effective rate, and `ops/check-live.ts` asserts the achieved rate against the
+ceiling from a live run. See defect #56.
+
+### Recorded run from the device, after the fixes
+
+The same flow was re-run on a release APK built from the corrected source
+(Android 15 emulator, `ops/e2e-app.mjs`):
+
+```
+51 / 51 on-device checks passed
+```
+
+The run's own live figures, with the ceiling in force, are asserted by
+`ops/check-live.ts` rather than transcribed here, so they cannot drift out of
+date. Its 33 checks currently pass, including:
+
+```
+spike   requested 2000 rps -> target 30 rps -> achieved 30.22 rps
+flood   10 connections at 40 rps -> achieved 40.11 rps in total
+crawl   recorded User-Agent == the User-Agent the fixture received (7 compared)
+browser 4-5 distinct profiles across 9 requests once the config stops pinning a UA
+```
 
 ---
 
@@ -222,13 +271,47 @@ consecutive repeat: none
 | 44 | `Text` primitive lacked `selectable` | Header values and URLs could not be copied out of a finding | Added |
 | 45 | Protected fixture could only allow or block | "Blocking began at iteration N" was untestable — there was no mid-run throttle | Fixture now rate-limits after N requests, matching a real edge |
 
+### Concurrency, billing and evidence pass
+
+| # | Defect | Impact | Fix |
+|---|---|---|---|
+| 56 | **Dispatch pacing was per worker, not per test** | `threads × 1000/interval` was the real rate: the defaults (20 threads, 50 ms) put **400 rps** on the target while the config said 20, and `maxRps` was ignored entirely — the platform's own ceiling was unenforceable. Measured at **485 rps against a 50 rps target** | A shared `makePacer` serialises dispatch scheduling; `effectiveRps` applies the ceiling and the run reports both the requested and the clamped rate |
+| 57 | **The flood's `rps` was per connection** | `flood.rps` is documented as the target rate, but 100 connections at 50 rps sent 5000 rps while config and report both said 50 | Paced across the whole test; measured at **40.11 rps** for a 40 rps target |
+| 58 | **One failed trace INSERT poisoned the flush chain** | `flushing = flushing.then(...)` left the chain rejected, so every later batch was silently dropped — the run reported success with most of its evidence missing — and the teardown threw before `activeRuns.delete`, stranding the run as `running` forever | The chain is anchored on a settled link, the first failure is recorded and surfaced, and teardown runs unconditionally |
+| 59 | **`runPool` siblings kept attacking after a worker threw** | Measured: **400 further requests fired at the target** after the pool's promise had already rejected. The caller believed the run had stopped; the target disagreed | A failure flag stops new claims; in-flight items settle before the error is rethrown |
+| 60 | **`openConnection().send()` never cleared its timeout timer** | Every flood connection held a live timer for the full timeout after answering — thousands of pending timers on a real run, and a socket that errored before the status line left the promise pending | One `finish()` path clears the timer and detaches every listener; socket `error`/`close` also settle it |
+| 61 | **`sleep()` leaked an abort listener on every call** | Measured: **50 listeners** after 50 sleeps on one signal; a long load test trips `MaxListenersExceeded` and retains every closure | The listener is removed on the normal path |
+| 62 | **Credit check and debit were not atomic** | Both were separate statements, so two concurrent submissions passed on a stale balance and overdrew; a run that never finished was never debited at all | The cost is **reserved** inside the transaction that reads the balance, then **settled** against the tests that actually sent traffic. A partial unique index on `(run_id) WHERE reason='run'` makes settlement idempotent |
+| 63 | **`credits_used` recorded the planned cost, not the actual one** | The run row and the ledger disagreed | Both are written from the settled amount |
+| 64 | **A test skipped for an invalid config, or an executor that threw before its first request, was still billed** | The operator paid for work that never happened | Billing follows **emitted probes**: a test is charged only if it put at least one request on the wire |
+| 65 | **Top-up requests were a `delta = 0` row in the ledger and nothing could grant credits** | "An administrator will approve it" was unimplementable — there was no endpoint anywhere that could add credits to a user, and no way to list requests | Requests have their own table with a lifecycle; `GET /api/admin/credit-requests` and `POST /api/admin/users/:id/credits` were added. Existing marker rows are migrated across and removed from the ledger |
+| 66 | **The crawler sent one profile's headers and recorded another's** | Two `buildFor` calls per page consumed two rotation steps and could pick different profiles, so the evidence showed headers the target never received | One build per page, used for both the request and the trace. Verified header-for-header against the fixture |
+| 67 | **The crawler seeded its queue with `buildFor(ctx, String(depth))`** | Substituted the crawl depth into any injection point in the URL and burned a rotation step before the first fetch | Seeded from the configured entry URL with a null payload |
+| 68 | A browser profile was claimed even when the config's own `User-Agent` overrode it | Rotation state advanced on every request while the target saw one unchanging string, and nothing told the operator their anonymity setting was doing nothing | A profile is reported only when it shaped the request; a one-time warning explains the override |
+| 69 | **`identity.name` was `run.provenance.device ? '' : ''` — always empty** | The operator's own display name was never scrubbed from an outbound request | `Provenance.operatorName` travels with the run and is added to the sanitizer's needles |
+| 70 | **A structurally invalid config crashed the executor** | `Cannot read properties of undefined (reading 'query')` — surfaced as a failed run and a charge, with no actionable message | `validateConfig` rejects a missing `http`/`query`/`headers` block at submit (HTTP 422) and the request builder defaults defensively |
+| 71 | `x-cache` was listed as an Alibaba signature | It is one of the most common cache headers on the internet (CloudFront, Fastly, Varnish, nginx), so any of them could be reported as Alibaba | Removed; only Alibaba-specific signals remain |
+| 72 | **`/api/history?categories=` silently ignored an unknown value** | A typo widened the result set while the caller believed it had narrowed it | Unknown categories are rejected with HTTP 400 |
+| 73 | The `credits/request` route claimed admin visibility that did not exist | A dead-end button | Replaced by the real queue and grant endpoints above |
+| 74 | `findByText` in the E2E harness sampled the accessibility tree once | Assertions raced the UI: a correctly working screen could be reported as missing | Replaced by a polling `waitForOptional`; two genuinely synchronous reads also had a meaningless `await` |
+| 75 | `ops/tmp/` scratch scripts were outside every tsconfig, so `eslint .` reported parse errors | The bug-focused lint pass could not be run cleanly | Removed; the durable proofs now live in `apps/api/test/concurrency.test.ts` and `ops/check-live.ts` |
+
+Each of these was verified by observing the **old** behaviour, not by reasoning
+about it. Representative measurements, taken against the pre-fix code:
+
+```
+runPool:  5 items at rejection, 400 items after 600ms      (new: <=10)
+sleep:    50 leaked abort listeners                        (new: 0)
+pacing:   485 rps against a 50 rps target                  (new: 30.22 rps against a 30 rps cap)
+```
+
 ### Code re-read
 
 | # | Defect | Impact | Fix |
 |---|---|---|---|
 | 46 | **The connection flood's raw sockets bypassed the egress proxy** | With a proxy configured, a flood still went out from the executor's own IP — silently defeating the anonymity feature for the noisiest test | Raw sockets now CONNECT-tunnel, with auth |
 | 47 | **The config screen's Save button persisted nothing** | It reported "Configuration saved" and wrote nothing — `api.saveConfig` was never called | Save now writes, reports failure honestly, and saved configs are loadable from the Import screen |
-| 48 | **A failed run charged the full planned cost** | A run that failed after 1 of 12 tests still billed for 12 | Charges only for tests that produced probes |
+| 48 | **A failed run charged the full planned cost** | A run that failed after 1 of 12 tests still billed for 12 | Superseded by #64: billing now follows emitted probes, on a settled reservation |
 | 49 | Per-test metrics were **computed and discarded** (`void metricsByTest`) | Every run did the work and threw the result away | Persisted into the run summary; they are the observability payload |
 | 50 | **Fastly matched on the generic `via: varnish` header** | Self-hosted Varnish was misidentified as Fastly — they share a lineage | Fastly now matches only its own headers |
 | 51 | `Apache-Coyote/1.1` matched `apache` before `tomcat` | Tomcat origins were reported as Apache httpd | Specific signatures now precede general ones |

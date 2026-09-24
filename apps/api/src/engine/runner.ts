@@ -36,7 +36,23 @@ export interface RunStore {
   markStarted(runId: string, startedAt: Date): Promise<void>;
   markProgress(runId: string, patch: Partial<RunRecord>): Promise<void>;
   markFinished(runId: string, patch: Partial<RunRecord>): Promise<void>;
-  chargeCredits(runId: string, userId: string, credits: number): Promise<void>;
+  /**
+   * Reserve a run's cost atomically with the balance check. Returns false when
+   * the balance is insufficient, having written nothing.
+   */
+  reserveCredits(userId: string, runId: string, credits: number): Promise<boolean>;
+  /**
+   * Settle a run's reserved cost against the tests that actually executed.
+   * Returns the amount charged. Must be idempotent per run: the runner treats a
+   * repeated settlement as a no-op rather than a second charge.
+   */
+  settleCredits(runId: string, userId: string, actual: number): Promise<number>;
+  /**
+   * Release a reservation in full because the run never executed. Used when the
+   * execution queue rejects the run: the target was never touched, so the
+   * operator must not be left holding the cost.
+   */
+  refundCredits(runId: string, userId: string): Promise<number>;
 }
 
 /* ------------------------------------------------------------------ *
@@ -76,8 +92,10 @@ export interface ExecuteRunResult {
   summary: RunSummary;
   durationMs: number;
   error: string | null;
-  /** Tests that produced at least one probe, and so were charged for. */
+  /** Tests that emitted at least one probe, and so were charged for. */
   chargedTestIds: TestId[];
+  /** Credits debited for this run, after settling the reservation. */
+  creditsCharged: number;
 }
 
 /**
@@ -111,6 +129,18 @@ export async function executeRun(args: ExecuteRunArgs): Promise<ExecuteRunResult
   let bytesSent = 0;
   let bytesReceived = 0;
   const ttfbSamples: number[] = [];
+  /**
+   * Tests that put at least one request on the wire.
+   *
+   * Populated as traces are emitted, not when the executor is invoked. Two
+   * earlier rules were wrong in opposite directions: deriving it from
+   * `metricsByTest` billed for configs that were skipped as invalid, and
+   * marking it at the call site billed for an executor that threw before it
+   * sent anything (a malformed config crashed the request builder and still
+   * cost a credit). "Sent traffic" is the only rule the operator can check
+   * against the evidence.
+   */
+  const emittedTestIds = new Set<TestId>();
 
   const publish = (patch: Partial<RunProgress> = {}): void => {
     const elapsedMs = Date.now() - startedAt.getTime();
@@ -134,11 +164,24 @@ export async function executeRun(args: ExecuteRunArgs): Promise<ExecuteRunResult
   const buffer: TraceDraft[] = [];
   let flushTimer: NodeJS.Timeout | null = null;
   let flushing: Promise<void> = Promise.resolve();
+  /** First write failure, surfaced once at the end of the run. */
+  let flushError: unknown = null;
 
   const flush = async (): Promise<void> => {
     if (buffer.length === 0) return;
     const batch = buffer.splice(0, buffer.length);
-    flushing = flushing.then(() => store.insertTraces(run.id, batch));
+    // The chain is anchored on a *settled* link. Chaining straight onto the
+    // previous promise meant one failed INSERT left `flushing` rejected, so
+    // every later `.then` was skipped: the rest of the run's evidence was
+    // silently dropped. Recovery is explicit instead.
+    flushing = flushing.catch(() => undefined).then(async () => {
+      try {
+        await store.insertTraces(run.id, batch);
+      } catch (error) {
+        flushError ??= error;
+        throw error;
+      }
+    });
     await flushing;
   };
 
@@ -151,6 +194,7 @@ export async function executeRun(args: ExecuteRunArgs): Promise<ExecuteRunResult
   };
 
   const emitTrace = async (draft: TraceDraft): Promise<void> => {
+    emittedTestIds.add(draft.testId);
     buffer.push(draft);
     completed += 1;
     if (draft.verdict === 'blocked') blocked += 1;
@@ -180,13 +224,25 @@ export async function executeRun(args: ExecuteRunArgs): Promise<ExecuteRunResult
   // outgoing requests. It is never itself transmitted.
   const identity: OperatorIdentity = {
     email: run.provenance.operatorEmail,
-    name: run.provenance.device ? '' : '',
+    // Used only as extra needles for the identity sanitizer. This was
+    // `device ? '' : ''` — always empty — so the operator's own display name
+    // was never scrubbed from an outbound request that happened to contain it.
+    name: run.provenance.operatorName ?? '',
+  };
+
+  // One counter for the whole run, shared by every executor context, so a
+  // trace's seq is unique within the run and findings resolve to the right row.
+  let seqCounter = 0;
+  const allocateSeq = (): number => {
+    seqCounter += 1;
+    return seqCounter;
   };
 
   const buildContext = (config: AttackConfig): ExecutorContext => {
     const test = getTest(config.testId);
     return {
       config,
+      allocateSeq,
       identity,
       target: normaliseTarget(config.target.domain, config.target),
       emit: emitTrace,
@@ -251,10 +307,21 @@ export async function executeRun(args: ExecuteRunArgs): Promise<ExecuteRunResult
   } catch (err) {
     runError = err instanceof Error ? err.message : String(err);
   } finally {
+    // Teardown must be unconditional. Previously a rejected flush escaped this
+    // block, so `activeRuns.delete` never ran: the run stayed in the cancel map
+    // forever and its status was never written, leaving it "running" in the
+    // database with no process behind it.
     if (flushTimer) clearTimeout(flushTimer);
-    await flush();
-    await flushing;
-    activeRuns.delete(run.id);
+    try {
+      await flush();
+      await flushing;
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      flushError ??= err;
+      if (!runError) runError = `Evidence could not be stored: ${detail}`;
+    } finally {
+      activeRuns.delete(run.id);
+    }
   }
 
   // --- roll up ------------------------------------------------------
@@ -308,22 +375,16 @@ export async function executeRun(args: ExecuteRunArgs): Promise<ExecuteRunResult
     error: runError,
   });
 
-  // Tests that produced at least one probe. Used for billing and for the
-  // run's reported outcome.
-  const ranTestIds = new Set<TestId>(Object.keys(metricsByTest) as TestId[]);
-
-  // Charge only for tests that actually ran.
+  // Charge only for tests that actually sent traffic.
   //
-  // This previously charged `totalCreditCost(configs)` — the full planned cost —
-  // regardless of how much work happened, so a run that failed after one of
-  // twelve tests still billed for twelve.
-  if (status !== 'cancelled') {
-    const billable = run.configs.filter((config) => ranTestIds.has(config.testId));
-    const credits = totalCreditCost(billable);
-    if (credits > 0) {
-      await store.chargeCredits(run.id, run.provenance.operatorId, credits);
-    }
-  }
+  // Three earlier rules were each wrong. Charging the planned cost billed for
+  // twelve tests when one ran. Deriving the set from `metricsByTest` billed for
+  // a config that was skipped as invalid. Marking it when the executor was
+  // invoked billed for an executor that threw before its first request. The
+  // reservation is settled against probes actually emitted.
+  const billable = run.configs.filter((config) => emittedTestIds.has(config.testId));
+  const actual = totalCreditCost(billable);
+  const charged = await store.settleCredits(run.id, run.provenance.operatorId, actual);
 
   bus.publish({
     runId: run.id,
@@ -340,8 +401,8 @@ export async function executeRun(args: ExecuteRunArgs): Promise<ExecuteRunResult
     message: runError ?? 'Run complete',
   });
 
-  const chargedTestIds = [...ranTestIds];
-  return { status, summary, durationMs, error: runError, chargedTestIds };
+  const chargedTestIds = [...emittedTestIds];
+  return { status, summary, durationMs, error: runError, chargedTestIds, creditsCharged: charged };
 }
 
 /** Findings for a completed run, ready to be persisted. */

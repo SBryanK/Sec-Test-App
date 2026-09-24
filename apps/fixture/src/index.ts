@@ -159,7 +159,6 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const body = ['POST', 'PUT', 'PATCH'].includes(req.method ?? '') ? await readBody(req) : '';
 
   const queryString = url.search;
-  const headerBlob = JSON.stringify(req.headers);
 
   // --- protected mode: a WAF that normalises before matching ---
   if (MODE === 'protected') {

@@ -164,8 +164,30 @@ specific operator and an exact parameter set.
 re-attacks the target. BullMQ's `attempts` must stay at 1.
 
 **Backpressure is honest.** Three independent ceilings apply: a per-run request
-budget, a global per-run ceiling, and a queue depth limit that returns HTTP 503
-rather than silently queueing without bound.
+budget, a global per-run rate ceiling (`maxRps`), and a queue depth limit that
+returns HTTP 503 rather than silently queueing without bound.
+
+The rate ceiling is enforced by a shared pacer, not by a per-worker sleep. A
+per-worker sleep multiplies the real request rate by the worker count — the
+defaults once produced 400 rps from a config that said 20 — so the ceiling is
+applied to dispatch scheduling across the whole test. When a config asks for
+more than the ceiling allows, the run records both the requested and the
+effective rate in its per-test metrics rather than quietly testing something
+else. `ops/check-live.ts` asserts this against a real fixture.
+
+**Credits are reserved, then settled.** A run's cost is held at submit time,
+inside the same transaction that reads the operator's balance, so two
+simultaneous submissions cannot both pass on a stale balance. When the run ends,
+the reservation is settled against the tests that actually emitted a probe: a
+test that was skipped as invalid, or an executor that threw before its first
+request, is not billed. Both `runs.credits_used` and the ledger are written from
+the settled figure, and `ops/check-live.ts` checks the arithmetic end to end.
+
+**Cancelled and rejected runs release their hold.** A run rejected because the
+queue was saturated, or cancelled before it sent anything, must not leave the
+operator's balance encumbered. Reversals are compensating ledger rows
+(`run_refund`), never deletions — the ledger is an audit trail, and an entry
+that vanishes leaves no evidence a hold was ever placed.
 
 **Health endpoint.** `GET /api/health` reports `queueDepth` and `activeRuns` —
 wire these to your orchestrator's readiness probe so a saturated node stops

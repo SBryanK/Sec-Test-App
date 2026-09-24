@@ -1,5 +1,5 @@
 import type { AttackConfig, TestId } from '@teo/shared';
-import { list, num } from '../requestBuilder.ts';
+import { list, str, num } from '../requestBuilder.ts';
 import type { Executor } from './context.ts';
 import { connectionFloodExecutor, httpSpikeExecutor } from './dos.ts';
 import { oversizedBodyExecutor, pathTraversalExecutor, sqlInjectionExecutor, xssExecutor } from './web.ts';
@@ -56,7 +56,7 @@ export function planProbes(config: AttackConfig): number {
 
     case 'path_traversal': {
       const payloads = list(v, 'pt.payloads').length;
-      const encoding = String(v['pt.encoding'] ?? 'auto');
+      const encoding = str(v, 'pt.encoding', 'auto');
       const multiplier = encoding === 'auto' ? 4 : 1;
       return Math.max(1, payloads * multiplier);
     }

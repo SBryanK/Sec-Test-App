@@ -1,5 +1,5 @@
 import type { AttackConfig, ConfigValues, HttpMethod, InjectionPoint, KvPair } from '@teo/shared';
-import { getTest, hasPayloadPlaceholder, substitute } from '@teo/shared';
+import { hasPayloadPlaceholder, substitute } from '@teo/shared';
 import type { NormalisedTarget } from '@teo/shared';
 import type { TemplateVars } from '@teo/shared';
 import {
@@ -16,13 +16,23 @@ export interface BuiltRequest {
   method: HttpMethod;
   headers: Record<string, string>;
   body: string | null;
-  /** The payload that was placed into this request, if any. */
+  /**
+   * The payload that was actually placed on the wire, or null.
+   *
+   * This is the truth, not the intent: `recordProbe` persists this value, so a
+   * probe can never claim to have sent a payload it did not send.
+   */
   payload: string | null;
   injectionPoint: InjectionPoint | null;
   /** User-Agent actually transmitted, for the forensic record. */
   userAgent: string;
   /** Browser profile used, when in browser mode. */
   profileId: string | null;
+  /**
+   * True when a browser profile was selected but the config's own headers
+   * replaced its User-Agent, so no rotation reached the wire.
+   */
+  profileOverridden?: boolean;
   /** Headers dropped because they carried operator identity. */
   redactedHeaders: string[];
 }
@@ -91,11 +101,10 @@ export function buildRequest(
   options: BuildRequestOptions = {},
 ): BuiltRequest {
   const { extraVars = {}, identity = null, previousProfile = null, navigation = false } = options;
-  const test = getTest(config.testId);
   const point = injectionPointFor(config);
 
   const token =
-    typeof config.values['auth.token'] === 'string' ? (config.values['auth.token'] as string) : '';
+    typeof config.values['auth.token'] === 'string' ? (config.values['auth.token']) : '';
 
   const vars: TemplateVars = {
     PAYLOAD: payload ?? '',
@@ -104,14 +113,18 @@ export function buildRequest(
     TARGET: target.host,
     USERNAME:
       typeof config.values['bf.username'] === 'string'
-        ? (config.values['bf.username'] as string)
+        ? (config.values['bf.username'])
         : 'admin',
-    DEPTH: String(config.values['crawl.depth'] ?? ''),
+    DEPTH: num(config.values, 'crawl.depth', 0) > 0 ? String(num(config.values, 'crawl.depth', 0)) : '',
     ...extraVars,
   };
 
   // --- query ---------------------------------------------------------
-  let queryPairs: KvPair[] = config.http.query.map((p) => ({ ...p }));
+  // Defaulted rather than dereferenced directly: a config from an older client
+  // or a hand-written API call may omit these, and the builder is reached
+  // before any validation can help. A missing list means "no query", not a
+  // crash halfway through a run.
+  const queryPairs: KvPair[] = (config.http.query ?? []).map((p) => ({ ...p }));
   let payloadUsed = false;
 
   for (const pair of queryPairs) {
@@ -119,23 +132,41 @@ export function buildRequest(
   }
   const bodyHasPlaceholder = hasPayloadPlaceholder(config.http.body ?? '');
   if (bodyHasPlaceholder) payloadUsed = true;
-  for (const header of config.http.headers) {
+  for (const header of config.http.headers ?? []) {
     if (hasPayloadPlaceholder(header.value ?? '')) payloadUsed = true;
   }
 
-  if (payload !== null && !payloadUsed && payload !== undefined) {
-    const param = targetParameter(config);
-    const effectivePoint = point ?? 'query';
-    if (param) {
-      const idx = queryPairs.findIndex((p) => p.key === param);
-      if (effectivePoint === 'query') {
-        if (idx >= 0) queryPairs[idx] = { ...queryPairs[idx], value: payload } as KvPair;
-        else queryPairs.push({ key: param, value: payload });
+  // The configured injection point, defaulting to the query string.
+  const effectivePoint: InjectionPoint = point ?? 'query';
+  const param = targetParameter(config);
+  let payloadSent = payloadUsed && payload !== null;
+
+  if (payload !== null && !payloadUsed) {
+    switch (effectivePoint) {
+      case 'query': {
+        if (param) {
+          const idx = queryPairs.findIndex((p) => p.key === param);
+          if (idx >= 0) queryPairs[idx] = { ...queryPairs[idx], value: payload } as KvPair;
+          else queryPairs.push({ key: param, value: payload });
+          payloadSent = true;
+        } else if (queryPairs.length > 0) {
+          // Fall back to the first parameter so a payload is always exercised.
+          const first = queryPairs[0];
+          if (first) queryPairs[0] = { ...first, value: payload };
+          payloadSent = true;
+        }
+        break;
       }
-    } else if (effectivePoint === 'query' && queryPairs.length > 0) {
-      // Fall back to the first parameter so a payload is always exercised.
-      const first = queryPairs[0];
-      if (first) queryPairs[0] = { ...first, value: payload };
+      case 'body':
+      case 'json_field':
+        // Handled below, once the body has been assembled.
+        break;
+      case 'header':
+        // Applied once the header block exists, further down.
+        break;
+      case 'path':
+        // Handled with the path below.
+        break;
     }
   }
 
@@ -177,6 +208,13 @@ export function buildRequest(
     headers['Accept'] = identityHeaders.headers['Accept'] ?? '*/*';
   }
 
+  // Header injection, applied now that the header block exists.
+  if (payload !== null && !payloadUsed && effectivePoint === 'header') {
+    const headerName = param ?? 'X-Injection-Point';
+    headers[headerName] = payload;
+    payloadSent = true;
+  }
+
   // Drop an Authorization header that resolved to an empty bearer token.
   const authKey = Object.keys(headers).find((k) => k.toLowerCase() === 'authorization');
   if (authKey) {
@@ -192,17 +230,48 @@ export function buildRequest(
     body = substitute(config.http.body, vars);
   }
 
-  // Explicit target-parameter injection into the body when configured.
-  if (payload !== null && point === 'body' && !bodyHasPlaceholder && body === null) {
-    const param = targetParameter(config);
-    if (param) body = `${encodeURIComponent(param)}=${encodeURIComponent(payload)}`;
+  // Body injection. This previously required `body === null`, but `body` is
+  // non-null whenever the config declares one — so a test configured for body
+  // injection sent the original body untouched while the trace still recorded
+  // the payload and the injection point. Every branch below now sets
+  // `payloadSent` only when the payload really is in the body.
+  if (payload !== null && !payloadUsed && (effectivePoint === 'body' || effectivePoint === 'json_field')) {
+    const contentType = Object.entries(headers)
+      .find(([k]) => k.toLowerCase() === 'content-type')?.[1]
+      ?.toLowerCase();
+
+    const isJson =
+      effectivePoint === 'json_field' ||
+      (contentType?.includes('json') ?? false) ||
+      (body !== null && body.trim().startsWith('{'));
+
+    if (isJson) {
+      try {
+        const parsed = JSON.parse(body && body.trim() ? body : '{}') as Record<string, unknown>;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+        const field = param ?? Object.keys(parsed)[0] ?? 'q';
+        parsed[field] = payload;
+        body = JSON.stringify(parsed);
+        payloadSent = true;
+      } catch {
+        // Not parseable as a JSON object: fall through to the form encoding.
+      }
+    }
+
+    if (!payloadSent) {
+      const field = param ?? 'q';
+      const encoded = `${encodeURIComponent(field)}=${encodeURIComponent(payload)}`;
+      body = body && body.trim() ? `${body}&${encoded}` : encoded;
+      payloadSent = true;
+    }
   }
 
   // --- path ----------------------------------------------------------
   let path = substitute(config.http.path || '/', vars);
   if (!path.startsWith('/')) path = `/${path}`;
-  if (payload !== null && point === 'path') {
+  if (payload !== null && !payloadUsed && effectivePoint === 'path') {
     path = path.replace(/\/?$/, `/${encodeURIComponent(payload)}`);
+    payloadSent = true;
   }
 
   const url = `${target.origin}${path}${query ? `?${query}` : ''}`;
@@ -216,15 +285,34 @@ export function buildRequest(
       ? orderHeaders(sanitized.headers, identityHeaders.family)
       : sanitized.headers;
 
+  // A profile is only claimed when it actually shaped the request.
+  //
+  // The config's own headers take precedence over the profile's, by design — an
+  // explicit `User-Agent` in the config is an operator decision. But the trace
+  // still reported the rotating `profileId`, so a run whose config pinned a
+  // single User-Agent claimed a fresh browser profile on every request while
+  // the target saw one unchanging string. Report null instead: the evidence
+  // should describe the bytes that left the machine.
+  const profileApplied =
+    identityHeaders.profileId !== null &&
+    Object.entries(identityHeaders.headers).some(
+      ([key, value]) =>
+        key.toLowerCase() === 'user-agent' &&
+        finalHeaders['User-Agent'] === value,
+    );
+
   return {
     url,
     method: config.http.method,
     headers: finalHeaders,
     body,
-    payload,
-    injectionPoint: point,
+    // Null when the payload could not be placed, so the trace cannot claim a
+    // request that was never made.
+    payload: payloadSent ? payload : null,
+    injectionPoint: payloadSent ? effectivePoint : null,
     userAgent: finalHeaders['User-Agent'] ?? finalHeaders['user-agent'] ?? '',
-    profileId: identityHeaders.profileId,
+    profileId: profileApplied ? identityHeaders.profileId : null,
+    profileOverridden: identityHeaders.profileId !== null && !profileApplied,
     redactedHeaders: sanitized.removed,
   };
 }
@@ -287,9 +375,19 @@ export function bool(values: ConfigValues, id: string, fallback = false): boolea
   return fallback;
 }
 
+/**
+ * Read a config value that must be a string.
+ *
+ * `ConfigValues` holds `string | number | boolean | string[] | KvPair[]`, so a
+ * bare `String(value)` on an array yields `"a,b"` and on an object yields
+ * `"[object Object]"` — silently, and in a way that compares unequal to
+ * everything. Always go through here.
+ */
 export function str(values: ConfigValues, id: string, fallback = ''): string {
   const raw = values[id];
-  return typeof raw === 'string' ? raw : fallback;
+  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'number' || typeof raw === 'boolean') return String(raw);
+  return fallback;
 }
 
 export function list(values: ConfigValues, id: string): string[] {

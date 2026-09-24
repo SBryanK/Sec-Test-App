@@ -1,5 +1,4 @@
 import type { InjectionPoint } from '@teo/shared';
-import { probe } from '../httpClient.ts';
 import {
   classifyGeneric,
   detectAuthBypass,
@@ -13,7 +12,7 @@ import {
   formatBytes,
   type Detection,
 } from '../detectors.ts';
-import { bool, buildRequest, generateOversizedBody, list, num, type BuiltRequest } from '../requestBuilder.ts';
+import { bool, generateOversizedBody, list, str, num, type BuiltRequest } from '../requestBuilder.ts';
 import {
   buildFor,
   probeWith,
@@ -38,8 +37,11 @@ export const sqlInjectionExecutor: Executor = async (ctx): Promise<ExecutorOutco
 
   ctx.log(`Testing ${payloads.length} SQL payloads`);
 
+  // Must go through probeWith: a raw probe() call silently drops the egress
+  // proxy, sending the most sensitive payload stream from the executor's own
+  // address even when a proxy is configured.
   const send = async (built: BuiltRequest) =>
-    probe({
+    probeWith(ctx, {
       url: built.url,
       method: built.method,
       headers: built.headers,
@@ -260,7 +262,7 @@ export const xssExecutor: Executor = async (ctx): Promise<ExecutorOutcome> => {
 
 export const pathTraversalExecutor: Executor = async (ctx): Promise<ExecutorOutcome> => {
   const payloads = list(ctx.config.values, 'pt.payloads');
-  const encoding = String(ctx.config.values['pt.encoding'] ?? 'auto');
+  const encoding = str(ctx.config.values, 'pt.encoding', 'auto');
   const nextSeq = makeSeqFactory(ctx);
 
   const variants = expandEncodings(payloads, encoding);

@@ -17,6 +17,20 @@ import type {
   UserAccount,
 } from '@teo/shared';
 
+import {
+  ApiError,
+  DEFAULT_API_PORT,
+  createRequester,
+  normaliseServerUrl,
+  type DiscoveryResult,
+} from './core.ts';
+
+// Re-exported so existing call sites keep importing from this module. The
+// implementations live in `core.ts`, which has no platform dependency and is
+// therefore unit-testable (see test/api-client.test.ts).
+export { ApiError, DEFAULT_API_PORT, normaliseServerUrl };
+export type { DiscoveryResult };
+
 const STORAGE_KEY = 'teo.apiBaseUrl';
 const TOKEN_KEY = 'teo.session';
 
@@ -53,225 +67,77 @@ export async function setBaseUrl(url: string): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ *
- * Server URL handling (team onboarding)
+ * Session
  * ------------------------------------------------------------------ */
-
-export const DEFAULT_API_PORT = 8787;
-
-/**
- * Turn whatever a team member types into a usable base URL.
- *
- * People type `192.168.1.42`, or paste `192.168.1.42:8787/`, or paste a full
- * `http://host:port/api/health` from a browser. All three should work — asking
- * someone to remember the scheme and port is how you end up debugging a
- * connection problem over chat instead of testing.
- */
-export function normaliseServerUrl(input: string): string {
-  let value = (input ?? '').trim();
-  if (!value) throw new Error('Enter your server address');
-
-  // Tolerate a pasted URL that includes a path.
-  value = value.split(/[?#]/)[0] ?? value;
-
-  if (!/^https?:\/\//i.test(value)) {
-    value = `http://${value}`;
-  }
-
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new Error(`"${input}" is not a valid address`);
-  }
-
-  // Strip a trailing /api/... path if someone pasted an endpoint.
-  parsed.pathname = parsed.pathname.replace(/\/api\/.*$/, '').replace(/\/+$/, '');
-  parsed.search = '';
-  parsed.hash = '';
-
-  if (!parsed.port) parsed.port = String(DEFAULT_API_PORT);
-  if (parsed.pathname && parsed.pathname !== '/') parsed.pathname = '';
-
-  return `${parsed.protocol}//${parsed.host}`;
-}
-
-export interface DiscoveryResult {
-  name: string;
-  version: string;
-  testCount: number;
-  addresses: string[];
-  reachedAt: string;
-}
-
-/**
- * Check whether a server answers, and describe it.
- *
- * Uses the unauthenticated discovery endpoint so a team member can verify the
- * address *before* they have credentials.
- */
-export async function probeServer(url: string, timeoutMs = 8000): Promise<DiscoveryResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(`${url.replace(/\/+$/, '')}/api/discovery`, {
-      signal: controller.signal,
-      headers: { Accept: 'application/json' },
-    });
-    if (!res.ok) throw new Error(`Server replied with HTTP ${res.status}`);
-    return (await res.json()) as DiscoveryResult;
-  } catch (err) {
-    if (err instanceof Error && err.name === 'AbortError') {
-      throw new Error(`No response within ${timeoutMs / 1000}s — check the address and that you are on the same network`);
-    }
-    throw new Error(
-      err instanceof Error
-        ? `${err.message} — check the address and that you are on the same network`
-        : 'Could not reach the server',
-    );
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 export function getSession(): AuthSession | null {
   return session;
 }
 
-/**
- * The session token lives in the platform keystore, not AsyncStorage.
- *
- * AsyncStorage is unencrypted SQLite inside the app sandbox — readable on a
- * rooted or jailbroken device, and included in some device backups. This app
- * holds a long-lived credential that can launch traffic at customer
- * infrastructure, so it belongs in the Keychain / Android Keystore.
- */
 async function readStoredSession(): Promise<string | null> {
+  // SecureStore first (Keychain / Keystore). Fall back to AsyncStorage so a
+  // session written by an earlier build is not lost on upgrade.
   try {
     const secure = await SecureStore.getItemAsync(TOKEN_KEY);
     if (secure) return secure;
-    // Migrate a token written by an older build, then remove the plaintext copy.
-    const legacy = await AsyncStorage.getItem(TOKEN_KEY);
-    if (legacy) {
-      await SecureStore.setItemAsync(TOKEN_KEY, legacy);
-      await AsyncStorage.removeItem(TOKEN_KEY);
-      return legacy;
-    }
-    return null;
   } catch {
-    // SecureStore is unavailable on web and in some test environments; fall
-    // back rather than losing the session entirely.
-    return AsyncStorage.getItem(TOKEN_KEY);
+    /* SecureStore is unavailable on web and some emulators */
   }
+  return AsyncStorage.getItem(TOKEN_KEY);
 }
 
 export async function loadSession(): Promise<AuthSession | null> {
   const raw = await readStoredSession();
   if (!raw) return null;
   try {
-    session = JSON.parse(raw) as AuthSession;
+    const parsed = JSON.parse(raw) as AuthSession;
+    if (!parsed?.token || !parsed.user) return null;
+    session = parsed;
     return session;
   } catch {
+    // A corrupt blob must not brick the app: drop it and start signed out.
+    await saveSession(null);
     return null;
   }
 }
 
 export async function saveSession(next: AuthSession | null): Promise<void> {
   session = next;
-  try {
-    if (next) {
-      await SecureStore.setItemAsync(TOKEN_KEY, JSON.stringify(next));
-      await AsyncStorage.removeItem(TOKEN_KEY);
-    } else {
+  if (!next) {
+    try {
       await SecureStore.deleteItemAsync(TOKEN_KEY);
-      await AsyncStorage.removeItem(TOKEN_KEY);
+    } catch {
+      /* ignore */
     }
-  } catch {
-    if (next) await AsyncStorage.setItem(TOKEN_KEY, JSON.stringify(next));
-    else await AsyncStorage.removeItem(TOKEN_KEY);
+    await AsyncStorage.removeItem(TOKEN_KEY);
+    return;
   }
-}
-
-/* ------------------------------------------------------------------ *
- * Error type
- * ------------------------------------------------------------------ */
-
-export class ApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly code?: string,
-  ) {
-    super(message);
-    this.name = 'ApiError';
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * Core request
- * ------------------------------------------------------------------ */
-
-interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
-  body?: unknown;
-  /** Return raw text instead of parsed JSON. */
-  raw?: boolean;
-  timeoutMs?: number;
-  signal?: AbortSignal;
-}
-
-async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = 'GET', body, raw = false, timeoutMs = 30_000, signal } = options;
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  if (signal) signal.addEventListener('abort', () => controller.abort(), { once: true });
-
-  const headers: Record<string, string> = { Accept: 'application/json' };
-  if (body !== undefined) headers['Content-Type'] = 'application/json';
-  if (session?.token) headers.Authorization = `Bearer ${session.token}`;
-
+  const raw = JSON.stringify(next);
   try {
-    const response = await fetch(`${baseUrl}${path}`, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: controller.signal,
-    });
-
-    if (raw) return (await response.text()) as T;
-
-    const text = await response.text();
-    const parsed = text ? (JSON.parse(text) as unknown) : {};
-
-    if (!response.ok) {
-      const payload = parsed as { message?: string; error?: string };
-      throw new ApiError(
-        payload.message ?? `Request failed with HTTP ${response.status}`,
-        response.status,
-        payload.error,
-      );
-    }
-    return parsed as T;
-  } catch (err) {
-    if (err instanceof ApiError) throw err;
-    if (err instanceof Error && err.name === 'AbortError') {
-      throw new ApiError(`Request timed out after ${timeoutMs}ms`, 0, 'timeout');
-    }
-    throw new ApiError(
-      err instanceof Error ? err.message : 'Network request failed',
-      0,
-      'network_error',
-    );
-  } finally {
-    clearTimeout(timer);
+    await SecureStore.setItemAsync(TOKEN_KEY, raw);
+  } catch {
+    /* fall through to AsyncStorage below */
   }
+  await AsyncStorage.setItem(TOKEN_KEY, raw);
 }
+
+/* ------------------------------------------------------------------ *
+ * Request plumbing
+ * ------------------------------------------------------------------ */
+
+const requester = createRequester({
+  getBaseUrl: () => baseUrl,
+  getToken: () => session?.token ?? null,
+});
+
+const request = requester.request;
+export const probeServer = requester.probeServer;
 
 /* ------------------------------------------------------------------ *
  * Endpoints
  * ------------------------------------------------------------------ */
 
-export interface LoginResponse extends AuthSession {}
+export type LoginResponse = AuthSession;
 
 export const api = {
   async health(): Promise<{ status: string; version: string; queueDepth: number }> {

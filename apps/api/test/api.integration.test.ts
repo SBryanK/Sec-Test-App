@@ -53,7 +53,10 @@ async function waitForRun(id: string, timeoutMs = 90_000): Promise<{ status: str
     if (body?.run && !['queued', 'running'].includes(body.run.status)) {
       return { status: body.run.status, summary: body.run.summary };
     }
-    await new Promise((r) => setTimeout(r, 400));
+    // Block body: a concise arrow would return the timer from the executor.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 400);
+    });
   }
   throw new Error(`Run ${id} did not settle within ${timeoutMs}ms`);
 }

@@ -117,7 +117,13 @@ const SIGNATURES: Signature[] = [
     code: 'alibaba',
     name: 'Alibaba Cloud CDN / ESA',
     kind: 'edge',
-    headers: ['ali-swift-global-savetime', 'x-swift-cachetime', 'eagleid', 'x-cache'],
+    // `x-cache` is deliberately absent. It is one of the most widely used
+    // cache headers on the internet — CloudFront, Fastly, Varnish and countless
+    // nginx configs all set it — so listing it here reported any of them as
+    // Alibaba whenever the provider's own header was missing or stripped. The
+    // remaining signals are Alibaba-specific: the Swift save-time pair, the
+    // EagleEye trace id, and the `cacheN.l2` Via pattern.
+    headers: ['ali-swift-global-savetime', 'x-swift-cachetime', 'eagleid', 'ali-swift-stat-host'],
     headerValues: [{ header: 'via', pattern: /cache\d*\.l2/i }],
     server: /tengine|alicdn/i,
   },

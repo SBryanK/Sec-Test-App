@@ -344,6 +344,12 @@ export interface TestOutcome {
 export interface Provenance {
   operatorId: string;
   operatorEmail: string;
+  /**
+   * Operator's display name. Travels with the run for two reasons: the
+   * anonymity sanitizer must scrub it from outbound requests exactly like the
+   * email address, and the audit trail should name the human who fired the run.
+   */
+  operatorName?: string;
   /** Device that launched the run. */
   device: string;
   platform: string;
@@ -497,12 +503,35 @@ export interface ExportRequest {
  * ------------------------------------------------------------------ */
 
 /** The `TestParameters` JSON document referenced by the import templates. */
+/** The document we *emit* — well-formed by construction. */
 export interface TestParametersDocument {
   $schema?: string;
   version: 1;
-  tests: Array<{
-    testId: TestId;
-    target: TargetBlock;
+  tests: TestParametersEntry[];
+}
+
+export interface TestParametersEntry {
+  testId: TestId;
+  target: TargetBlock;
+  http?: Partial<HttpBlock>;
+  values?: ConfigValues;
+  options?: Partial<ExecutionOptions>;
+}
+
+/**
+ * The document we *accept*, which is untrusted.
+ *
+ * This arrives as JSON from a file the operator pasted in, so nothing about it
+ * is guaranteed. Typing it as {@link TestParametersDocument} would be a lie the
+ * compiler believes: the `isTestId` guard around `testId` would narrow to
+ * `never`, hiding the fact that an unknown id is entirely possible at runtime.
+ */
+export interface TestParametersInput {
+  $schema?: unknown;
+  version?: unknown;
+  tests?: Array<{
+    testId?: unknown;
+    target?: { domain?: unknown; port?: unknown; useTls?: unknown };
     http?: Partial<HttpBlock>;
     values?: ConfigValues;
     options?: Partial<ExecutionOptions>;

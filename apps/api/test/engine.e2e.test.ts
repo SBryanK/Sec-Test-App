@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 
-import type { AttackConfig, NormalisedTarget, TestId } from '@teo/shared';
+import type { AttackConfig, TestId } from '@teo/shared';
 import { buildDefaultConfig, normaliseTarget } from '@teo/shared';
 
 import { executorFor, planProbes } from '../src/engine/executors/index.ts';
@@ -50,11 +50,12 @@ async function runExecutor(
   tweak(config);
 
   const traces: TraceDraft[] = [];
-  let seq = 0;
+  let seqCounter = 0;
+  const seq = 0;
 
   const ctx: ExecutorContext = {
     config,
-    target: normaliseTarget(domain) as NormalisedTarget,
+    target: normaliseTarget(domain),
     emit: async (draft) => {
       traces.push(draft);
     },
@@ -65,6 +66,10 @@ async function runExecutor(
     log: () => undefined,
     plannedProbes: planProbes(config),
     rotation: { previous: null },
+    allocateSeq: () => {
+      seqCounter += 1;
+      return seqCounter;
+    },
   };
   void seq;
 
@@ -236,7 +241,7 @@ describe('engine E2E — vulnerable target', () => {
     );
     assert.match(
       withAddress[0]?.result.remoteAddress ?? '',
-      /^[0-9a-fA-F.:\[\]]+:\d+$/,
+      /^[0-9a-fA-F.:[\]]+:\d+$/,
       'remote address should be host:port',
     );
   });
@@ -248,7 +253,10 @@ describe('engine E2E — vulnerable target', () => {
       c.values['crawl.max_pages'] = 30;
       c.values['crawl.delay'] = 0;
     });
-    assert.ok(Number(r.metrics.pagesFetched) >= 5, `expected several pages, got ${r.metrics.pagesFetched}`);
+    assert.ok(
+      Number(r.metrics.pagesFetched) >= 5,
+      `expected several pages, got ${String(r.metrics.pagesFetched)}`,
+    );
     assertTelemetry(r.traces, 'web_crawler');
   });
 });
@@ -305,7 +313,7 @@ describe('engine E2E — protected target', () => {
     const blocked = r.traces.filter((t) => t.verdict === 'blocked').map((t) => t.iteration);
     assert.equal(firstBlocked, Math.min(...blocked), 'should be the earliest blocked iteration');
     assert.ok(
-      r.traces.some((t) => t.verdict === 'passed' && t.iteration < (firstBlocked as number)),
+      r.traces.some((t) => t.verdict === 'passed' && t.iteration < (firstBlocked)),
       'the burst should have been served before blocking began',
     );
   });

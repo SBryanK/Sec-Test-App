@@ -276,21 +276,30 @@ defended one.
 ## Verification
 
 ```bash
-./ops/verify.sh          # everything: typecheck, unit, integration, E2E
+./ops/verify.sh          # everything: typecheck, lint, unit, integration, live checks
 ```
 
 Or individually:
 
 ```bash
-npm run typecheck                       # all workspaces
-npx tsx --test apps/api/test/detectors.test.ts          # 49 detector unit tests
-npx tsx --test apps/api/test/engine.e2e.test.ts         # 19 executor E2E tests
-npx tsx --test apps/api/test/api.integration.test.ts    # 29 API tests
+npm run typecheck                                        # all workspaces
+npx eslint .                                             # bug-focused lint pass
+npx tsx --test apps/api/test/detectors.test.ts           # 52 detector unit tests
+npx tsx --test apps/api/test/engine.e2e.test.ts          # 22 executor E2E tests
+npx tsx --test apps/api/test/api.integration.test.ts     # 30 API tests
+npx tsx --test apps/api/test/concurrency.test.ts         # 18 load-primitive tests
+npx tsx --test apps/mobile/test/api-client.test.ts       # 23 API client tests
+npx tsx ops/check-live.ts                                # 33 live checks (stack must be up)
 ```
 
 The engine tests run each executor against **two** fixtures — one vulnerable,
 one protected — and assert opposite verdicts. A detector that always fires
 passes the first half and fails the second.
+
+`ops/check-live.ts` covers the claims a mock cannot: it reads the fixture's own
+request log to confirm the `User-Agent` in each trace is the one the target
+received, and reads the credit ledger to confirm that charges follow traffic
+rather than intent. It runs as part of `ops/verify.sh`.
 
 See **[docs/VALIDATION.md](docs/VALIDATION.md)** for recorded results.
 

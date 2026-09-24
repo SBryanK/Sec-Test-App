@@ -7,7 +7,7 @@ import { Badge, Card, Header, Screen, Text } from '../../src/components/ui';
 import { CartFab } from '../../src/components/CartFab';
 import { useI18n } from '../../src/i18n';
 import { useCatalog } from '../../src/state';
-import { font, palette, radius, spacing } from '../../src/theme';
+import { palette, radius, spacing } from '../../src/theme';
 
 const FEASIBILITY: Record<
   string,

@@ -77,12 +77,17 @@ export interface ExecutorContext {
   /** Number of probes this executor expects to run, for the progress bar. */
   plannedProbes: number;
   /**
+   * Allocates the next run-wide sequence number. Shared across every config in
+   * the run, so `seq` is unique within a run.
+   */
+  allocateSeq: () => number;
+  /**
    * Carries the previously used browser profile across requests in a run so
    * rotation actually rotates. Without this, each independent pick can land on
    * the same profile twice in a row, which is exactly what a fingerprinting
    * system treats as suspicious.
    */
-  rotation: { previous: BrowserProfile | null };
+  rotation: { previous: BrowserProfile | null; warnedOverridden?: boolean };
 }
 
 /** Convenience: build a request with this context's identity already applied. */
@@ -100,6 +105,17 @@ export function buildFor(
   if (built.profileId) {
     ctx.rotation.previous =
       BROWSER_PROFILES.find((p) => p.id === built.profileId) ?? ctx.rotation.previous;
+  }
+
+  // Warn once, not per request: an operator who selected browser anonymity but
+  // pinned a User-Agent in the Headers section is getting no rotation at all,
+  // and nothing on screen said so.
+  if (built.profileOverridden && !ctx.rotation.warnedOverridden) {
+    ctx.rotation.warnedOverridden = true;
+    ctx.log(
+      'Browser anonymity is on, but the Headers section sets its own User-Agent, ' +
+        'so no profile rotation is reaching the target. Clear that header to rotate.',
+    );
   }
 
   return built;
@@ -132,7 +148,7 @@ export type Executor = (ctx: ExecutorContext) => Promise<ExecutorOutcome>;
  * Shared helpers used by every executor
  * ------------------------------------------------------------------ */
 
-let seqCounters = new WeakMap<object, number>();
+const seqCounters = new WeakMap<object, number>();
 
 export function makeSeqFactory(ctx: ExecutorContext): () => number {
   let counter = seqCounters.get(ctx) ?? 0;
@@ -202,7 +218,17 @@ export function redactHeaders(headers: Record<string, string>): Record<string, s
   return out;
 }
 
-/** Bounded-concurrency worker pool that respects an abort signal. */
+/**
+ * Bounded-concurrency worker pool that respects an abort signal.
+ *
+ * If one worker throws, the remaining runners stop *claiming new items* rather
+ * than racing through the rest of the list. Without that, a load test whose
+ * first worker blew up would still fire every remaining request while the run
+ * recorded a single error: the target sees the whole attack and the evidence
+ * captures almost none of it. In-flight items are allowed to settle before the
+ * error is rethrown, so the caller never unwinds while probes are still being
+ * written.
+ */
 export async function runPool<T>(
   items: T[],
   concurrency: number,
@@ -211,34 +237,100 @@ export async function runPool<T>(
 ): Promise<void> {
   const limit = Math.max(1, Math.min(concurrency, items.length || 1));
   let cursor = 0;
+  let failed = false;
+  let firstError: unknown = null;
 
   const runners = Array.from({ length: limit }, async () => {
     for (;;) {
-      if (signal?.aborted) return;
+      if (failed || signal?.aborted) return;
       const index = cursor;
       cursor += 1;
       if (index >= items.length) return;
       const item = items[index] as T;
-      await worker(item, index);
+      try {
+        await worker(item, index);
+      } catch (error) {
+        // Keep only the first failure: the rest are almost always the same root
+        // cause and would bury it.
+        if (!failed) {
+          failed = true;
+          firstError = error;
+        }
+        return;
+      }
     }
   });
 
-  await Promise.all(runners);
+  // `allSettled` cannot reject, so siblings still in flight can never surface as
+  // an unhandled rejection while we wait for them.
+  await Promise.allSettled(runners);
+
+  if (failed) throw firstError;
 }
 
+/**
+ * Abortable sleep.
+ *
+ * The abort listener is removed on the normal path. Leaving it attached added
+ * one listener per sleep to a run-long signal, which retains the closure and
+ * eventually trips Node's max-listeners warning on long load tests.
+ */
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (ms <= 0) return Promise.resolve();
+  if (signal?.aborted) return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      { once: true },
-    );
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
+}
+
+/**
+ * Shared dispatch pacer for the load tests.
+ *
+ * A per-worker sleep does not bound a run's request rate: N workers each
+ * sleeping `interval` ms dispatch at `N / interval`, so "20 threads at 50 ms"
+ * is 400 rps, not 20. That made the platform's own `maxRps` ceiling
+ * unenforceable — a config could sit inside every documented field limit and
+ * still put multiples of the intended load on the target. The pacer serialises
+ * only the *scheduling*, so the ceiling holds no matter how many workers exist.
+ *
+ * It deliberately does not catch up after falling behind: `nextAt` is rebased
+ * to "now" whenever the schedule slips, so a stalled target is never answered
+ * with a compensating burst.
+ */
+export function makePacer(targetRps: number, signal?: AbortSignal): () => Promise<void> {
+  const minGapMs = targetRps > 0 && Number.isFinite(targetRps) ? 1000 / targetRps : 0;
+  let nextAt = 0;
+  let chain: Promise<void> = Promise.resolve();
+
+  return () => {
+    chain = chain.then(async () => {
+      if (minGapMs <= 0) return;
+      const now = Date.now();
+      const wait = Math.max(0, nextAt - now);
+      nextAt = Math.max(now, nextAt) + minGapMs;
+      if (wait > 0) await sleep(wait, signal);
+    });
+    return chain;
+  };
+}
+
+/**
+ * The request rate a config asks for, after the platform ceiling is applied.
+ * The `clamped` flag lets a run state plainly that a cap changed the rate,
+ * instead of quietly testing something other than what was configured.
+ */
+export function effectiveRps(requested: number, ceiling: number): { rps: number; clamped: boolean } {
+  if (!Number.isFinite(requested) || requested <= 0) return { rps: ceiling, clamped: false };
+  if (requested > ceiling) return { rps: ceiling, clamped: true };
+  return { rps: requested, clamped: false };
 }
 
 /** Findings are only produced for actionable verdicts. */

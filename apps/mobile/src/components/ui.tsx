@@ -18,7 +18,6 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   font,
   fontSize,
-  fontWeight,
   palette,
   radius,
   shadow,

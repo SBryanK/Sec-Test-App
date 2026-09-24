@@ -7,7 +7,7 @@ import type { RunRecord } from '@teo/shared';
 
 import { api } from '../src/api/client';
 import { exportRun, type ExportKind } from '../src/lib/export';
-import { Badge, Banner, Button, Card, EmptyState, Header, Screen, Text } from '../src/components/ui';
+import { Badge, Banner, Card, EmptyState, Header, Screen, Text } from '../src/components/ui';
 import { font, palette, radius, spacing } from '../src/theme';
 
 const FORMATS: Array<{ kind: ExportKind; label: string; hint: string; icon: keyof typeof Ionicons.glyphMap }> = [

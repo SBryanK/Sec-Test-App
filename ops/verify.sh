@@ -93,9 +93,15 @@ run_suite() {
 # afford them rather than failing later with an opaque HTTP 402.
 npm run credits:topup -- 500 >/dev/null 2>&1 || true
 
+# The engine suites talk to the fixture directly; `check-live` goes through the
+# API, so it needs the base URL the app would use.
+export API_URL="${API_URL:-$(api_url)}"
+export FIXTURE_URL="${FIXTURE_URL:-http://127.0.0.1:9900}"
+
 run_suite "detectors"   "apps/api/test/detectors.test.ts"
 run_suite "fingerprint" "apps/api/test/fingerprint.test.ts"
 run_suite "anonymity"   "apps/api/test/anonymity.test.ts"
+run_suite "concurrency" "apps/api/test/concurrency.test.ts"
 run_suite "engine-e2e"  "apps/api/test/engine.e2e.test.ts"
 run_suite "catalog"     "packages/shared/test/catalog.test.ts"
 run_suite "api"         "apps/api/test/api.integration.test.ts"
@@ -124,6 +130,13 @@ else
   tail -10 /tmp/teo-build.log
 fi
 run_suite "ui-contract" "apps/mobile/test/ui-contract.test.ts"
+run_suite "api-client"  "apps/mobile/test/api-client.test.ts"
+
+# Live behavioural checks: what the *target* observed and what the *ledger*
+# recorded. These need the stack up (the step above starts it) and they consume
+# real credits against the local fixture, which is exactly the point — a unit
+# test cannot prove that the recorded User-Agent is the one that was sent.
+run_suite "live"        "ops/check-live.ts"
 
 # --------------------------------------------------------------------------
 section "Result"

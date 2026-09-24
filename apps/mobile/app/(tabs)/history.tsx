@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
@@ -24,13 +24,12 @@ import {
   Card,
   Chip,
   EmptyState,
-  Header,
   Screen,
   Text,
 } from '../../src/components/ui';
 import { useI18n } from '../../src/i18n';
 import { useCatalog } from '../../src/state';
-import { font, palette, radius, severityColor, spacing } from '../../src/theme';
+import { font, palette, radius, spacing } from '../../src/theme';
 
 const STATUSES: Array<{ key: RunStatus | 'any'; label: string }> = [
   { key: 'any', label: 'Any Status' },
@@ -88,21 +87,38 @@ export default function HistoryScreen(): React.JSX.Element {
     };
   }, [status, selectedCategories, domainContains, quickRange]);
 
+  /**
+   * Requests are sequenced.
+   *
+   * `filter` contains the free-text domain box, so this fires on every
+   * keystroke. Without a guard, a response for "ex" landing after the response
+   * for "example.com" would leave the list showing results for a prefix of what
+   * the input says — and the operator could act on the wrong set.
+   */
+  const requestSeq = useRef(0);
+
   const load = useCallback(async () => {
+    const seq = (requestSeq.current += 1);
     try {
       setError(null);
       const page = await api.history(filter);
+      if (seq !== requestSeq.current) return; // a newer request superseded this one
       setRuns(page.runs);
     } catch (err) {
+      if (seq !== requestSeq.current) return;
       setError(err instanceof Error ? err.message : t('common.error'));
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (seq === requestSeq.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, [filter, t]);
 
+  // Debounce so typing does not fire one request per character.
   useEffect(() => {
-    void load();
+    const timer = setTimeout(() => void load(), 250);
+    return () => clearTimeout(timer);
   }, [load]);
 
   const visible = useMemo(() => {

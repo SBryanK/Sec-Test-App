@@ -1,11 +1,10 @@
-import { probe } from '../httpClient.ts';
 import {
   classifyGeneric,
   detectBlocked,
   detectBotHandling,
   type Detection,
 } from '../detectors.ts';
-import { bool, buildRequest, list, num, str } from '../requestBuilder.ts';
+import { bool, list, num, str } from '../requestBuilder.ts';
 import {
   probeWith,
   buildFor,
@@ -175,7 +174,9 @@ const LINK_RE = /href\s*=\s*["']([^"'#]+)["']/gi;
 
 export const webCrawlerExecutor: Executor = async (ctx): Promise<ExecutorOutcome> => {
   const depth = Math.max(1, Math.min(num(ctx.config.values, 'crawl.depth', 2), 5));
-  const respectRobots = String(ctx.config.values['crawl.respect_robots'] ?? 'yes') === 'yes';
+  // `str` rather than String(): an array value would stringify to "a,b" and
+  // silently read as 'ignore robots.txt'.
+  const respectRobots = str(ctx.config.values, 'crawl.respect_robots', 'yes') === 'yes';
   const maxPages = Math.min(num(ctx.config.values, 'crawl.max_pages', 100), ctx.budget.maxRequests);
   const delayMs = num(ctx.config.values, 'crawl.delay', 50);
   const nextSeq = makeSeqFactory(ctx);
@@ -190,9 +191,11 @@ export const webCrawlerExecutor: Executor = async (ctx): Promise<ExecutorOutcome
   const findings: NonNullable<ReturnType<typeof findingFrom>>[] = [];
   const verdicts: Detection[] = [];
   const seen = new Set<string>();
-  const queue: Array<{ url: string; level: number }> = [
-    { url: buildFor(ctx, String(depth)).url, level: 0 },
-  ];
+  // Seed from the configured entry URL. This used to be
+  // `buildFor(ctx, String(depth)).url`, which substituted the crawl depth into
+  // any injection point in the URL and burned a browser-profile rotation step
+  // before a single page had been fetched.
+  const queue: Array<{ url: string; level: number }> = [{ url: buildFor(ctx, null).url, level: 0 }];
 
   let fetched = 0;
   let throttled = 0;
@@ -211,16 +214,18 @@ export const webCrawlerExecutor: Executor = async (ctx): Promise<ExecutorOutcome
       continue;
     }
 
-    const built = {
-      ...buildFor(ctx, null),
-      url: node.url,
-      payload: String(depth),
-    };
+    // One build per page, used for both the request and the trace. Two separate
+    // `buildFor` calls consumed two rotation steps and — because each call can
+    // pick a different browser profile — the headers recorded in the evidence
+    // were not the headers that were actually sent. The crawl also forces GET,
+    // so building it that way keeps Content-Length and body headers off a
+    // request that carries no body.
+    const built = { ...buildFor(ctx, null), url: node.url, method: 'GET' as const, body: null };
 
     const result = await probeWith(ctx, {
       url: node.url,
       method: 'GET',
-      headers: buildFor(ctx, null).headers,
+      headers: built.headers,
       timeoutMs: ctx.config.options.timeoutMs,
       followRedirects: ctx.config.options.followRedirects,
       verifyTls: ctx.config.options.verifyTls,
@@ -245,10 +250,10 @@ export const webCrawlerExecutor: Executor = async (ctx): Promise<ExecutorOutcome
     const seq = await recordProbe({
       ctx,
       nextSeq,
-      method: 'GET',
-      url: node.url,
+      method: built.method,
+      url: built.url,
       headers: built.headers,
-      body: null,
+      body: built.body,
       payload: null,
       injectionPoint: null,
       result,

@@ -1,5 +1,5 @@
 import type { ProbeResult } from '../httpClient.ts';
-import { http, https, openConnection, probe } from '../httpClient.ts';
+import { http, https, openConnection } from '../httpClient.ts';
 import {
   analyseLoad,
   detectLoadResilience,
@@ -10,10 +10,12 @@ import { describeFingerprint, fingerprint } from '../fingerprint.ts';
 import {
   probeWith,
   buildFor,
+  effectiveRps,
   findingFrom,
+  makePacer,
+  makeSeqFactory,
   REFERENCES,
   runPool,
-  sleep,
   type Executor,
   type ExecutorContext,
   type ExecutorOutcome,
@@ -53,14 +55,25 @@ export const httpSpikeExecutor: Executor = async (ctx): Promise<ExecutorOutcome>
   const built = buildFor(ctx, null);
   const samples: LoadSample[] = [];
 
-  ctx.log(`Spiking ${burst} requests across ${threads} threads (${interval}ms interval)`);
+  // What the config asks for, versus what the platform ceiling will allow.
+  // `interval` is the per-thread delay, so the requested rate is
+  // `threads / interval`; the pacer then enforces it globally.
+  const requestedRps = interval > 0 ? (threads * 1000) / interval : ctx.budget.maxRps;
+  const { rps: targetRps, clamped } = effectiveRps(requestedRps, ctx.budget.maxRps);
+
+  ctx.log(
+    `Spiking ${burst} requests across ${threads} threads ` +
+      `(~${Math.round(targetRps)} rps target, ${interval}ms per-thread interval)` +
+      (clamped ? ` — capped from ${Math.round(requestedRps)} rps by the server limit` : ''),
+  );
 
   const startedAt = Date.now();
   const deadline = startedAt + durationSec * 1000;
 
   let dispatchIndex = 0;
-  let seqRef = 0;
+  const nextSeq = makeSeqFactory(ctx);
   let stoppedByDeadline = false;
+  const pace = makePacer(targetRps, ctx.signal);
 
   const worker = async (): Promise<void> => {
     for (;;) {
@@ -73,8 +86,11 @@ export const httpSpikeExecutor: Executor = async (ctx): Promise<ExecutorOutcome>
       dispatchIndex += 1;
       if (index >= burst) return;
 
-      // Pace dispatch globally: one request every `interval` ms.
-      await sleep(interval, ctx.signal);
+      // Global pacing. The per-worker `sleep(interval)` that used to live here
+      // multiplied the dispatch rate by the thread count and ignored
+      // `budget.maxRps` entirely, so a config could exceed the platform's own
+      // ceiling without any field being out of range.
+      await pace();
       if (ctx.signal.aborted) return;
 
       const result = await probeWith(ctx, {
@@ -88,15 +104,15 @@ export const httpSpikeExecutor: Executor = async (ctx): Promise<ExecutorOutcome>
         agent,
       });
 
+      const seq = nextSeq();
+
       samples.push({
         statusCode: result.statusCode,
         totalMs: result.timing.totalMs,
         error: result.error,
-        iteration: seqRef + 1,
+        iteration: seq,
       });
-
-      seqRef += 1;
-      await ctx.emit(makeLoadTrace(ctx, seqRef, seqRef, built, result));
+      await ctx.emit(makeLoadTrace(ctx, seq, seq, built, result));
     }
   };
 
@@ -128,7 +144,16 @@ export const httpSpikeExecutor: Executor = async (ctx): Promise<ExecutorOutcome>
   return {
     detection,
     findings: findings.filter((f): f is NonNullable<typeof f> => f !== null),
-    metrics: loadMetrics(analysis, { burst, threads, interval, durationSec, stoppedByDeadline }),
+    metrics: loadMetrics(analysis, {
+      burst,
+      threads,
+      interval,
+      durationSec,
+      stoppedByDeadline,
+      requestedRps: Math.round(requestedRps * 100) / 100,
+      targetRps: Math.round(targetRps * 100) / 100,
+      rateCappedByServerLimit: clamped,
+    }),
   };
 };
 
@@ -147,8 +172,12 @@ export const connectionFloodExecutor: Executor = async (ctx): Promise<ExecutorOu
   const built = buildFor(ctx, null);
   const path = new URL(built.url).pathname + new URL(built.url).search;
   const port = ctx.target.port ?? (ctx.target.useTls ? 443 : 80);
+  const intervalMs = Math.max(1, Math.round(1000 / rps));
 
-  ctx.log(`Opening ${connections} parallel connections to ${ctx.target.host}:${port}`);
+  ctx.log(
+    `Opening ${connections} parallel connections to ${ctx.target.host}:${port} ` +
+      `at ~${rps} rps total (1 request per ${intervalMs}ms)`,
+  );
 
   // Establish the connection pool first so handshake cost is measured, not mixed
   // into the request rate.
@@ -165,7 +194,7 @@ export const connectionFloodExecutor: Executor = async (ctx): Promise<ExecutorOu
   );
 
   const handshakes = await Promise.all(handles.map((h) => h.ready));
-  const liveSockets = handles.filter((h, i) => handshakes[i]?.error == null);
+  const liveSockets = handles.filter((_handle, i) => handshakes[i]?.error == null);
 
   const handshakeFailures = handshakes.filter((h) => h.error !== null).length;
   const meanHandshake =
@@ -180,9 +209,15 @@ export const connectionFloodExecutor: Executor = async (ctx): Promise<ExecutorOu
   const samples: LoadSample[] = [];
   const startedAt = Date.now();
   const durationMs = durationSec * 1000;
-  const intervalMs = Math.max(1, Math.round(1000 / rps));
 
-  let seqRef = 0;
+  // `flood.rps` is documented as the *target request rate*, so it is paced
+  // across the whole test rather than per connection. The per-connection sleep
+  // that used to be here multiplied the real rate by the connection count:
+  // 100 connections at 50 rps put 5000 rps on the target while the config and
+  // the report both said 50.
+  const pace = makePacer(rps, ctx.signal);
+
+  const nextSeq = makeSeqFactory(ctx);
   let sendCount = 0;
 
   await runPool(
@@ -190,19 +225,22 @@ export const connectionFloodExecutor: Executor = async (ctx): Promise<ExecutorOu
     liveSockets.length,
     async (handle) => {
       while (!ctx.signal.aborted && Date.now() - startedAt < durationMs) {
+        await pace();
+        if (ctx.signal.aborted) return;
+
         const began = Date.now();
         const outcome = await handle.send(`${built.method} ${path} HTTP/1.1`);
         const elapsed = Date.now() - began;
+
+        const seq = nextSeq();
+        sendCount += 1;
 
         samples.push({
           statusCode: outcome.statusCode,
           totalMs: elapsed,
           error: outcome.statusCode === null ? 'No status line received' : null,
-          iteration: seqRef + 1,
+          iteration: seq,
         });
-
-        seqRef += 1;
-        sendCount += 1;
 
         // Reused sockets cannot report per-phase timings; record the ones we
         // genuinely have and leave the handshake phases null rather than fake them.
@@ -233,8 +271,7 @@ export const connectionFloodExecutor: Executor = async (ctx): Promise<ExecutorOu
           error: outcome.statusCode === null ? 'No status line received within timeout' : null,
         };
 
-        await ctx.emit(makeLoadTrace(ctx, seqRef, seqRef, built, synthetic));
-        await sleep(intervalMs, ctx.signal);
+        await ctx.emit(makeLoadTrace(ctx, seq, seq, built, synthetic));
       }
     },
     ctx.signal,

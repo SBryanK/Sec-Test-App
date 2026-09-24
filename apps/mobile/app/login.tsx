@@ -7,7 +7,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ShieldMark } from '../src/components/ShieldMark';
 import { Banner, Button, Text } from '../src/components/ui';
 import { OutlinedInput } from '../src/components/fields';
-import { api, getBaseUrl, setBaseUrl } from '../src/api/client';
+import { getBaseUrl } from '../src/api/client';
 import { useI18n } from '../src/i18n';
 import { useAuth, useApiBaseUrl } from '../src/state';
 import { font, palette, radius, spacing, useResponsive } from '../src/theme';
@@ -18,15 +18,12 @@ export default function LoginScreen(): React.JSX.Element {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const { gutter, isCompact } = useResponsive();
-  const [apiUrl, setApiUrl] = useApiBaseUrl();
+  const [apiUrl] = useApiBaseUrl();
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [endpoint, setEndpoint] = useState('');
-  const [endpointSaved, setEndpointSaved] = useState(false);
 
   const submit = async (): Promise<void> => {
     if (!email.trim() || !password) {
@@ -42,19 +39,6 @@ export default function LoginScreen(): React.JSX.Element {
       setError(err instanceof Error ? err.message : t('login.failed'));
     } finally {
       setBusy(false);
-    }
-  };
-
-  const saveEndpoint = async (): Promise<void> => {
-    const next = (endpoint || apiUrl).trim();
-    if (!next) return;
-    await setApiUrl(next);
-    setEndpointSaved(true);
-    setError(null);
-    try {
-      await api.health();
-    } catch {
-      setError(`No API responded at ${next}`);
     }
   };
 
@@ -151,32 +135,6 @@ export default function LoginScreen(): React.JSX.Element {
             <Ionicons name="chevron-forward" size={13} color={palette.primary} />
           </Pressable>
 
-          {showAdvanced ? (
-            <View style={{ marginTop: spacing.md }}>
-              <OutlinedInput
-                label={t('profile.apiEndpoint')}
-                value={endpoint || apiUrl}
-                onChangeText={(v) => {
-                  setEndpoint(v);
-                  setEndpointSaved(false);
-                }}
-                placeholder="http://10.0.2.2:8787"
-                surface={palette.canvas}
-                hint={
-                  Platform.OS === 'android'
-                    ? 'Use 10.0.2.2 to reach a server on the emulator host.'
-                    : 'Use 127.0.0.1 to reach a server on this machine.'
-                }
-              />
-              <View style={{ height: spacing.md }} />
-              <Button
-                label={endpointSaved ? t('common.done') : t('common.retry')}
-                variant="secondary"
-                icon={endpointSaved ? 'checkmark' : 'refresh'}
-                onPress={() => void saveEndpoint()}
-              />
-            </View>
-          ) : null}
         </View>
       </ScrollView>
     </KeyboardAvoidingView>

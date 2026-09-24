@@ -3,7 +3,6 @@ import {
   bodyField,
   headersField,
   importTemplatesNote,
-  linesField,
   methodField,
   numberField,
   pathField,

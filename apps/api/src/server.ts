@@ -8,11 +8,11 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 
 import type {
   AttackConfig,
+  TestParametersInput,
   ExportFormat,
   HistoryFilter,
   RunMode,
   RunRecord,
-  TestCategoryId,
   TestId,
   TestParametersDocument,
   UserAccount,
@@ -33,6 +33,7 @@ import {
   tryGetTest,
   validateConfig,
 } from '@teo/shared';
+import type { TestCategoryId } from '@teo/shared';
 
 import { config as appConfig } from './config.ts';
 import { closePool } from './db/pool.ts';
@@ -45,6 +46,9 @@ import {
   createRegistrationRequest,
   createRun,
   deleteRun,
+  grantCredits,
+  listCreditRequests,
+  resolveCreditRequests,
   getFindings,
   getRun,
   getTraces,
@@ -185,7 +189,7 @@ class RunQueue {
     return true;
   }
 
-  private async drain(): Promise<void> {
+  private drain(): void {
     while (this.running < this.concurrency && this.pending.length > 0) {
       const task = this.pending.shift();
       if (!task) break;
@@ -244,7 +248,11 @@ export async function buildServer(): Promise<FastifyInstance> {
       try {
         done(null, JSON.parse(raw));
       } catch (err) {
-        done(err as Error, undefined);
+        // Tag it 400. Without a statusCode the handler reports a parse error as
+        // a 500 and echoes the parser's internal message to the client.
+        const bad = err as Error & { statusCode?: number };
+        bad.statusCode = 400;
+        done(bad, undefined);
       }
     },
   );
@@ -319,28 +327,66 @@ export async function buildServer(): Promise<FastifyInstance> {
    * shared engagement server is for. `private` restricts each operator to their
    * own — set RUN_VISIBILITY=private for least privilege.
    */
+  /**
+   * Parse an integer query parameter, clamped to sane bounds.
+   *
+   * `Number('abc')` is NaN, and NaN in `LIMIT $n` is a 500 from Postgres
+   * (`invalid input syntax for type bigint: "NaN"`).
+   */
+  const safeInt = (raw: string | undefined, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER): number => {
+    if (raw === undefined) return fallback;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(Math.max(Math.floor(parsed), min), max);
+  };
+
+  /**
+   * Parse the `categories` query filter. Unknown values are rejected rather
+   * than silently dropped: a typo used to make the filter match everything
+   * while the caller believed it had been narrowed.
+   */
+  const parseCategories = (raw: string | undefined, reply: FastifyReply): TestCategoryId[] | undefined | null => {
+    if (!raw) return undefined;
+    const parts = raw.split(',').map((c) => c.trim()).filter(Boolean);
+    const unknown = parts.filter((c) => !isCategoryId(c));
+    if (unknown.length > 0) {
+      void reply.code(400).send({
+        error: 'bad_request',
+        message: `Unknown category: ${unknown.join(', ')}`,
+      });
+      return null;
+    }
+    return parts as TestCategoryId[];
+  };
+
   const scopeFor = (user: UserAccount): string | undefined =>
     appConfig.security.runVisibility === 'private' ? user.id : undefined;
 
-  /** The authenticated account, already validated by the authenticate hook. */
-  const currentUser = async (req: FastifyRequest): Promise<UserAccount> => {
+  /**
+   * The authenticated account, already validated by the authenticate hook.
+   *
+   * Deliberately not `async`: it performs no I/O — the hook did the lookup and
+   * parked the result on the request — so `await`ing it at the call sites is a
+   * no-op that keeps the call shape uniform with the other helpers.
+   */
+  const currentUser = (req: FastifyRequest): UserAccount => {
     const cached = resolvedUser.get(req);
     if (cached) return cached;
 
-    // Defensive: reaching here means a route used currentUser without the
-    // authenticate preHandler. Reject rather than trust an unvalidated token.
-    const payload = req.user as { sub?: string } | undefined;
-    if (!payload?.sub) {
-      throw Object.assign(new Error('Authentication required'), { statusCode: 401 });
-    }
-    const user = await getUserById(payload.sub);
-    if (!user) throw Object.assign(new Error('User not found'), { statusCode: 401 });
-    return user;
+    // Reaching here means a route used currentUser without the authenticate
+    // preHandler. Reject outright rather than performing a partial check: the
+    // previous version only looked the account up, so a suspended operator or a
+    // revoked token would have been accepted — exactly the hole the hook exists
+    // to close.
+    throw Object.assign(
+      new Error('Route is missing the authenticate preHandler'),
+      { statusCode: 401 },
+    );
   };
 
   /** Require an admin, for access-control endpoints. */
-  const requireAdmin = async (req: FastifyRequest): Promise<UserAccount> => {
-    const user = await currentUser(req);
+  const requireAdmin = (req: FastifyRequest): UserAccount => {
+    const user = currentUser(req);
     if (user.role !== 'admin') {
       throw Object.assign(new Error('Administrator access required'), { statusCode: 403 });
     }
@@ -349,7 +395,7 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   /* ---------------- health & catalog ---------------- */
 
-  app.get('/api/health', async () => ({
+  app.get('/api/health', () => ({
     status: 'ok',
     version: appConfig.appVersion,
     uptimeSeconds: Math.round(process.uptime()),
@@ -365,7 +411,7 @@ export async function buildServer(): Promise<FastifyInstance> {
    * It deliberately exposes nothing sensitive: a name, a version, and the
    * addresses this host is reachable on.
    */
-  app.get('/api/discovery', async (req) => ({
+  app.get('/api/discovery', (req) => ({
     name: appConfig.serverName,
     version: appConfig.appVersion,
     testCount: TEST_COUNT,
@@ -380,7 +426,7 @@ export async function buildServer(): Promise<FastifyInstance> {
    * Authenticated: the catalog describes the available attack surface and is
    * not something an unauthenticated caller should be able to enumerate.
    */
-  app.get('/api/catalog', { preHandler: authenticate }, async () => ({
+  app.get('/api/catalog', { preHandler: authenticate }, () => ({
     categories: CATEGORIES,
     tests: ALL_TESTS,
     testCount: TEST_COUNT,
@@ -456,16 +502,18 @@ export async function buildServer(): Promise<FastifyInstance> {
     return {
       token,
       refreshToken: token,
+      // Derived from the configured lifetime, not hardcoded: a 1h token was
+      // reported to the client as expiring in 30 days.
       expiresAt:
         appConfig.jwtExpiry === 'never'
           ? 'never'
-          : new Date(Date.now() + 30 * 86_400_000).toISOString(),
+          : new Date(Date.now() + parseDurationMs(appConfig.jwtExpiry)).toISOString(),
       user: account,
     };
     },
   );
 
-  app.get('/api/auth/me', { preHandler: authenticate }, async (req) => currentUser(req));
+  app.get('/api/auth/me', { preHandler: authenticate }, (req) => currentUser(req));
 
   /**
    * Request access.
@@ -541,17 +589,17 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   /** Pending access requests. */
   app.get('/api/admin/requests', { preHandler: authenticate }, async (req) => {
-    await requireAdmin(req);
+    requireAdmin(req);
     return { requests: await listPendingUsers() };
   });
 
   app.get('/api/admin/users', { preHandler: authenticate }, async (req) => {
-    await requireAdmin(req);
+    requireAdmin(req);
     return { users: await listAllUsers() };
   });
 
   app.post('/api/admin/requests/:id/approve', { preHandler: authenticate }, async (req, reply) => {
-    const admin = await requireAdmin(req);
+    const admin = requireAdmin(req);
     const { id } = req.params as { id: string };
     const ok = await approveUser(id, admin.id);
     if (!ok) return reply.code(404).send({ error: 'not_found', message: 'No pending request with that id' });
@@ -559,7 +607,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.post('/api/admin/requests/:id/reject', { preHandler: authenticate }, async (req, reply) => {
-    await requireAdmin(req);
+    requireAdmin(req);
     const { id } = req.params as { id: string };
     const ok = await rejectUser(id);
     if (!ok) return reply.code(404).send({ error: 'not_found', message: 'No pending request with that id' });
@@ -567,7 +615,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.post('/api/admin/users/:id/suspend', { preHandler: authenticate }, async (req, reply) => {
-    const admin = await requireAdmin(req);
+    const admin = requireAdmin(req);
     const { id } = req.params as { id: string };
     if (id === admin.id) {
       return reply.code(400).send({ error: 'bad_request', message: 'You cannot suspend your own account' });
@@ -578,7 +626,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.post('/api/admin/users/:id/activate', { preHandler: authenticate }, async (req, reply) => {
-    await requireAdmin(req);
+    requireAdmin(req);
     const { id } = req.params as { id: string };
     const ok = await setUserStatus(id, 'active');
     if (!ok) return reply.code(404).send({ error: 'not_found', message: 'No such user' });
@@ -587,7 +635,7 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   /** Revoke every token an operator holds. Recovers from a leaked credential. */
   app.post('/api/admin/users/:id/revoke', { preHandler: authenticate }, async (req, reply) => {
-    const admin = await requireAdmin(req);
+    const admin = requireAdmin(req);
     const { id } = req.params as { id: string };
     if (id === admin.id) {
       return reply
@@ -596,6 +644,52 @@ export async function buildServer(): Promise<FastifyInstance> {
     }
     const version = await revokeUserTokens(id);
     return { revoked: true, id, tokenVersion: version };
+  });
+
+  /**
+   * The top-up queue. Operators reach it through the "Request More Credits"
+   * action on the profile screen; before this existed the request was recorded
+   * and then never surfaced anywhere, so the button silently did nothing.
+   */
+  app.get('/api/admin/credit-requests', { preHandler: authenticate }, async (req) => {
+    requireAdmin(req);
+    const q = req.query as Record<string, string | undefined>;
+    return { requests: await listCreditRequests(q.includeResolved === 'true') };
+  });
+
+  /**
+   * Grant credits and close out any pending request from that operator.
+   *
+   * Grant and resolve happen together on purpose: leaving the request open
+   * after a grant would show a queue that never drains, and resolving without
+   * granting would tell the operator their top-up was handled when it was not.
+   */
+  app.post('/api/admin/users/:id/credits', { preHandler: authenticate }, async (req, reply) => {
+    const admin = requireAdmin(req);
+    const { id } = req.params as { id: string };
+    const body = req.body as { credits?: number; note?: string } | undefined;
+    const credits = Number(body?.credits);
+
+    if (!Number.isFinite(credits) || Math.trunc(credits) === 0) {
+      return reply.code(400).send({ error: 'bad_request', message: 'credits must be a non-zero integer' });
+    }
+    if (Math.abs(credits) > 1_000_000) {
+      return reply.code(400).send({ error: 'bad_request', message: 'credits must be within ±1,000,000' });
+    }
+
+    const target = await getUserById(id);
+    if (!target) return reply.code(404).send({ error: 'not_found', message: 'No such user' });
+
+    await grantCredits(id, credits, admin.id, body?.note ? `admin-grant:${body.note.slice(0, 80)}` : 'admin-grant');
+    const resolved = credits > 0 ? await resolveCreditRequests(id, admin.id) : 0;
+    const updated = await getUserById(id);
+
+    req.log.info({ admin: admin.email, target: target.email, credits }, 'credits granted');
+    return {
+      user: updated,
+      granted: Math.trunc(credits),
+      requestsResolved: resolved,
+    };
   });
 
   /* ---------------- connection validation (Search tab) ---------------- */
@@ -681,7 +775,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   /* ---------------- runs ---------------- */
 
   app.post('/api/runs', { preHandler: authenticate }, async (req, reply) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const body = req.body as {
       configs?: AttackConfig[];
       mode?: RunMode;
@@ -739,6 +833,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     const provenance = {
       operatorId: user.id,
       operatorEmail: user.email,
+      operatorName: user.displayName,
       device: body?.device ?? 'unknown',
       platform: body?.platform ?? 'unknown',
       appVersion: body?.appVersion ?? appConfig.appVersion,
@@ -757,7 +852,12 @@ export async function buildServer(): Promise<FastifyInstance> {
       /* keep the raw string so the run is still recorded */
     }
 
-    const run = await createRun({
+    // Reserve the cost *before* the run is queued, in the same transaction that
+    // reads the balance. The stand-alone check above is only a fast path for a
+    // readable error message; this is the one that actually holds the credits,
+    // so two simultaneous submissions can no longer both pass on a stale
+    // balance and overdraw the account.
+    await createRun({
       id,
       userId: user.id,
       mode,
@@ -768,12 +868,53 @@ export async function buildServer(): Promise<FastifyInstance> {
       provenance,
     });
 
+    let reserved: boolean;
+    try {
+      reserved = await runStore.reserveCredits(user.id, id, credits);
+    } catch (err) {
+      // A reservation that throws would otherwise leave a 'queued' row with no
+      // process behind it, forever visible in the operator's history.
+      await deleteRun(id, user.id);
+      req.log.error({ err, runId: id }, 'credit reservation failed');
+      return reply.code(500).send({ error: 'internal_error', message: 'Could not reserve credits for this run' });
+    }
+    if (!reserved) {
+      // Nothing was written for this run: remove the placeholder row so a
+      // rejected submission does not litter the operator's history.
+      await deleteRun(id, user.id);
+      const fresh = await getUserById(user.id);
+      return reply.code(402).send({
+        error: 'insufficient_credits',
+        message: `This run costs ${credits} credit(s); ${fresh?.creditsRemaining ?? 0} remaining`,
+      });
+    }
+
+    const run = await getRun(id, user.id);
+    if (!run) {
+      await runStore.refundCredits(id, user.id);
+      return reply.code(500).send({ error: 'internal_error', message: 'Run could not be created' });
+    }
+
     const accepted = queue.enqueue(async () => {
       const args: ExecuteRunArgs = { run, store: runStore, bus, limits: appConfig.limits };
       await executeRun(args);
     });
 
     if (!accepted) {
+      // Mark it failed rather than leaving a 'queued' row that nothing will
+      // ever execute — and that a retry would duplicate. The reservation is
+      // released here too: the run never touched the target, so it must not
+      // cost anything. Leaking this was how "queue full" used to be free to
+      // the operator and, once reservations existed, would have been a
+      // permanent hold on their balance.
+      await runStore.markFinished(run.id, {
+        status: 'failed',
+        durationMs: 0,
+        finishedAt: new Date().toISOString(),
+        summary: null,
+        error: 'Rejected: execution queue is saturated',
+      });
+      await runStore.refundCredits(run.id, user.id);
       return reply.code(503).send({ error: 'queue_full', message: 'Execution queue is saturated; retry shortly' });
     }
 
@@ -781,7 +922,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.get('/api/runs/:id', { preHandler: authenticate }, async (req, reply) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const { id } = req.params as { id: string };
     const run = await getRun(id, scopeFor(user));
     if (!run) return reply.code(404).send({ error: 'not_found', message: 'Run not found' });
@@ -795,7 +936,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.get('/api/runs/:id/traces', { preHandler: authenticate }, async (req, reply) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const { id } = req.params as { id: string };
     const run = await getRun(id, scopeFor(user));
     if (!run) return reply.code(404).send({ error: 'not_found', message: 'Run not found' });
@@ -804,15 +945,15 @@ export async function buildServer(): Promise<FastifyInstance> {
     const traces = await getTraces(id, {
       testId: q.testId && isTestId(q.testId) ? q.testId : undefined,
       verdict: q.verdict as never,
-      limit: q.limit ? Number(q.limit) : 200,
-      offset: q.offset ? Number(q.offset) : 0,
+      limit: safeInt(q.limit, 200, 1, 2000),
+      offset: safeInt(q.offset, 0, 0),
       includeBodies: q.bodies !== 'false',
     });
     return { traces };
   });
 
   app.get('/api/runs/:id/findings', { preHandler: authenticate }, async (req, reply) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const { id } = req.params as { id: string };
     const run = await getRun(id, scopeFor(user));
     if (!run) return reply.code(404).send({ error: 'not_found', message: 'Run not found' });
@@ -821,7 +962,7 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   /** Live progress stream for the run screen. */
   app.get('/api/runs/:id/stream', { preHandler: authenticate }, async (req, reply) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const { id } = req.params as { id: string };
     const run = await getRun(id, scopeFor(user));
     if (!run) return reply.code(404).send({ error: 'not_found', message: 'Run not found' });
@@ -861,9 +1002,12 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.post('/api/runs/:id/cancel', { preHandler: authenticate }, async (req, reply) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const { id } = req.params as { id: string };
-    const run = await getRun(id, scopeFor(user));
+    // Owner-scoped, NOT visibility-scoped. Aborting truncates the trace log
+    // and skips billing, so it destroys evidence — a colleague being able to
+    // *see* a run must not mean they can stop it.
+    const run = await getRun(id, user.id);
     if (!run) return reply.code(404).send({ error: 'not_found', message: 'Run not found' });
 
     const controller = activeRuns.get(id);
@@ -875,7 +1019,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.delete('/api/runs/:id', { preHandler: authenticate }, async (req) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const { id } = req.params as { id: string };
     // Deletion is always owner-scoped, never visibility-scoped: being able to
     // *see* a colleague's run must not mean being able to destroy the evidence.
@@ -885,19 +1029,20 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   /* ---------------- history ---------------- */
 
-  app.get('/api/history', { preHandler: authenticate }, async (req) => {
-    const user = await currentUser(req);
+  app.get('/api/history', { preHandler: authenticate }, async (req, reply) => {
+    const user = currentUser(req);
     const q = req.query as Record<string, string | undefined>;
+
+    const categories = parseCategories(q.categories, reply);
+    if (categories === null) return reply;
 
     const filter: HistoryFilter = {
       status: (q.status as HistoryFilter['status']) ?? 'any',
-      categories: q.categories
-        ? (q.categories.split(',').filter(isCategoryId) as TestCategoryId[])
-        : undefined,
+      categories,
       domainContains: q.domainContains,
       from: q.from,
       to: q.to,
-      limit: q.limit ? Number(q.limit) : 25,
+      limit: safeInt(q.limit, 25, 1, 100),
       cursor: q.cursor,
     };
 
@@ -907,7 +1052,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   /* ---------------- export ---------------- */
 
   app.post('/api/export', { preHandler: authenticate }, async (req, reply) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const body = req.body as { runIds?: string[]; format?: ExportFormat; includeTraces?: boolean } | undefined;
     const runIds = body?.runIds ?? [];
     const format = body?.format ?? 'json';
@@ -1001,15 +1146,16 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   /* ---------------- credits & profile ---------------- */
 
-  app.get('/api/credits', { preHandler: authenticate }, async (req) => currentUser(req));
+  app.get('/api/credits', { preHandler: authenticate }, (req) => currentUser(req));
 
   app.post('/api/credits/request', { preHandler: authenticate }, async (req) => {
-    const user = await currentUser(req);
-    return requestCredits(user);
+    const user = currentUser(req);
+    const body = req.body as { note?: string } | undefined;
+    return requestCredits(user, body?.note);
   });
 
   app.patch('/api/profile/language', { preHandler: authenticate }, async (req, reply) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const body = req.body as { language?: string } | undefined;
     if (body?.language !== 'en' && body?.language !== 'zh') {
       return reply.code(400).send({ error: 'bad_request', message: 'language must be "en" or "zh"' });
@@ -1021,7 +1167,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   /* ---------------- saved configs ---------------- */
 
   app.post('/api/configs', { preHandler: authenticate }, async (req, reply) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const body = req.body as { testId?: string; name?: string; config?: AttackConfig } | undefined;
     if (!body?.testId || !isTestId(body.testId) || !body.config) {
       return reply.code(400).send({ error: 'bad_request', message: 'testId and config are required' });
@@ -1030,7 +1176,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   app.get('/api/configs', { preHandler: authenticate }, async (req) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     return { configs: await listSavedConfigs(user.id) };
   });
 
@@ -1056,7 +1202,7 @@ export async function buildServer(): Promise<FastifyInstance> {
    * overwritten, matching the "no override" behaviour described in the UI.
    */
   app.post('/api/import', { preHandler: authenticate }, async (req, reply) => {
-    const body = req.body as { document?: TestParametersDocument; cart?: AttackConfig[] } | undefined;
+    const body = req.body as { document?: TestParametersInput; cart?: AttackConfig[] } | undefined;
     const doc = body?.document;
 
     if (!doc || doc.version !== 1 || !Array.isArray(doc.tests)) {
@@ -1070,14 +1216,30 @@ export async function buildServer(): Promise<FastifyInstance> {
     const errors: Array<{ index: number; message: string }> = [];
 
     doc.tests.forEach((entry, index) => {
-      if (!isTestId(entry.testId)) {
-        errors.push({ index, message: `Unknown test id "${entry.testId}"` });
+      // Untrusted input: the id is `unknown` until this guard passes.
+      if (typeof entry.testId !== 'string' || !isTestId(entry.testId)) {
+        errors.push({
+          index,
+          message: `Unknown test id "${typeof entry.testId === 'string' ? entry.testId : typeof entry.testId}"`,
+        });
         return;
       }
-      const base = buildDefaultConfig(entry.testId, entry.target?.domain ?? '');
+      const domain = typeof entry.target?.domain === 'string' ? entry.target.domain : '';
+      const base = buildDefaultConfig(entry.testId, domain);
+
+      // Copy target fields individually. Spreading the parsed object would
+      // carry whatever types the file happened to contain straight into the
+      // engine — a string port, a numeric useTls — and only fail much later.
+      const port = Number(entry.target?.port);
+      const target = {
+        domain,
+        ...(Number.isFinite(port) && port > 0 && port <= 65535 ? { port } : {}),
+        ...(typeof entry.target?.useTls === 'boolean' ? { useTls: entry.target.useTls } : {}),
+      };
+
       const merged: AttackConfig = {
         ...base,
-        target: { ...base.target, ...entry.target },
+        target,
         http: { ...base.http, ...(entry.http ?? {}) },
         values: { ...base.values, ...(entry.values ?? {}) },
         options: { ...base.options, ...DEFAULT_EXECUTION_OPTIONS, ...(entry.options ?? {}) },
@@ -1096,12 +1258,16 @@ export async function buildServer(): Promise<FastifyInstance> {
    * verdict still holds. Backs the "verify" action on a finding.
    */
   app.post('/api/verify/:runId/:seq', { preHandler: authenticate }, async (req, reply) => {
-    const user = await currentUser(req);
+    const user = currentUser(req);
     const { runId, seq } = req.params as { runId: string; seq: string };
     const run = await getRun(runId, scopeFor(user));
     if (!run) return reply.code(404).send({ error: 'not_found', message: 'Run not found' });
 
-    const traces = (await getTraces(runId, { limit: 2000 })) as Array<{
+    const q = req.query as { testId?: string } | undefined;
+    const traces = (await getTraces(runId, {
+      limit: 20_000,
+      testId: q?.testId && isTestId(q.testId) ? q.testId : undefined,
+    })) as Array<{
       seq: number;
       method: string;
       url: string;
@@ -1143,7 +1309,9 @@ export async function buildServer(): Promise<FastifyInstance> {
     if (status >= 500) console.error('[api] unhandled error:', err);
     void reply.code(status).send({
       error: status >= 500 ? 'internal_error' : 'request_error',
-      message: err.message,
+      // Never echo an internal message on a 5xx: it can carry SQL, a parser's
+      // token dump, or a filesystem path.
+      message: status >= 500 ? 'The server could not complete the request.' : err.message,
     });
   });
 
@@ -1161,10 +1329,21 @@ interface ExportBundle {
 }
 
 function renderHtmlReport(bundles: ExportBundle[], user: UserAccount): string {
-  const escape = (value: unknown): string =>
-    String(value ?? '').replace(/[&<>"']/g, (c) =>
-      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c,
+  // HTML escaping, so it must never fall back to "[object Object]" or an
+  // array's comma-joined form for something that should be readable.
+  const escape = (value: unknown): string => {
+    const text = Array.isArray(value)
+      ? value.map((v) => escape(v)).join(', ')
+      : value === null || value === undefined
+        ? ''
+        : typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+          ? String(value)
+          : JSON.stringify(value);
+    return text.replace(
+      /[&<>"']/g,
+      (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c,
     );
+  };
 
   const sections = bundles
     .map(({ run, findings }) => {
@@ -1235,6 +1414,16 @@ function csv(value: string): string {
 }
 
 /** Strip credentials from a proxy URL before it is written to the database. */
+/** Milliseconds for a duration string like `30d`, `12h`, `45m`, `30s`. */
+function parseDurationMs(value: string): number {
+  const match = /^(\d+)\s*([smhd])?$/.exec(value.trim());
+  if (!match) return 30 * 86_400_000;
+  const amount = Number(match[1]);
+  const unit = match[2] ?? 'ms';
+  const factor = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000, ms: 1 }[unit] ?? 1;
+  return amount * factor;
+}
+
 function redactProxy(proxyUrl: string | null): string | null {
   if (!proxyUrl) return null;
   try {

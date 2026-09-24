@@ -160,8 +160,14 @@ export async function listRuns(
   }
 
   if (filter.cursor) {
-    params.push(filter.cursor);
-    where.push(`created_at < $${params.length}`);
+    // Runs can share a created_at; comparing the timestamp alone skips rows.
+    // The cursor is `<created_at>|<id>`.
+    const [cursorTime, cursorId] = filter.cursor.split('|');
+    params.push(cursorTime ?? filter.cursor);
+    const timeIdx = params.length;
+    params.push(cursorId ?? '00000000-0000-0000-0000-000000000000');
+    const idIdx = params.length;
+    where.push(`(created_at, id) < ($${timeIdx}::timestamptz, $${idIdx}::uuid)`);
   }
 
   const limit = Math.min(Math.max(filter.limit ?? 25, 1), 100);
@@ -169,23 +175,27 @@ export async function listRuns(
 
   const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await query<RunRow>(
-    `SELECT * FROM runs ${clause} ORDER BY created_at DESC LIMIT $${params.length}`,
+    `SELECT * FROM runs ${clause} ORDER BY created_at DESC, id DESC LIMIT $${params.length}`,
     params,
   );
 
   const hasMore = rows.length > limit;
   const page = hasMore ? rows.slice(0, limit) : rows;
 
+  // Count with the SAME predicates as the page. This reported the unscoped
+  // total, so a filtered query returned `runs: []` alongside `total: 100`.
+  const filterParams = params.slice(0, params.length - 1);
   const countResult = await query<{ count: string }>(
-    scopeUserId
-      ? `SELECT count(*)::text AS count FROM runs WHERE user_id = $1`
-      : `SELECT count(*)::text AS count FROM runs`,
-    scopeUserId ? [scopeUserId] : [],
+    `SELECT count(*)::text AS count FROM runs ${clause}`,
+    filterParams,
   );
 
   return {
     runs: page.map(mapRun),
-    nextCursor: hasMore && page.length > 0 ? (page[page.length - 1]?.created_at.toISOString() ?? null) : null,
+    nextCursor:
+      hasMore && page.length > 0
+        ? `${page[page.length - 1]?.created_at.toISOString() ?? ''}|${page[page.length - 1]?.id ?? ''}`
+        : null,
     total: Number(countResult.rows[0]?.count ?? 0),
   };
 }
@@ -379,7 +389,7 @@ export async function getTraces(runId: string, opts: TraceQueryOptions = {}): Pr
             verdict, severity, reason, signature, error, created_at
      FROM request_traces
      WHERE ${where.join(' AND ')}
-     ORDER BY seq ASC
+     ORDER BY seq ASC, id ASC
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     params,
   );
@@ -534,12 +544,15 @@ export async function insertFindings(
   // trace_ids is populated separately so a finding can cite probe sequence numbers.
   for (const f of findings) {
     if (f.traceSeqs.length === 0) continue;
+    // Scoped by test_id as well as seq. `seq` is unique per run now, but a
+    // finding must only ever cite its own test's probes — a seq-only match
+    // previously attached other tests' traces as evidence.
     await query(
       `UPDATE findings SET trace_ids = (
          SELECT COALESCE(array_agg(id), '{}') FROM request_traces
-         WHERE run_id = $1 AND seq = ANY($2::int[])
+         WHERE run_id = $1 AND test_id = $5 AND seq = ANY($2::int[])
        ), refs = $3::text[] WHERE id = $4`,
-      [runId, f.traceSeqs, f.references, f.id],
+      [runId, f.traceSeqs, f.references, f.id, f.testId],
     );
   }
 }
@@ -610,13 +623,132 @@ export const runStore: RunStore = {
     );
   },
 
-  async chargeCredits(runId: string, userId: string, credits: number): Promise<void> {
-    if (credits <= 0) return;
-    await withTransaction(async (client) => {
+  /**
+   * Reserve a run's cost, atomically with the balance check.
+   *
+   * The check and the debit must happen against the same locked row: doing the
+   * check with a plain SELECT at submit time and the debit at finish time let
+   * two concurrent submissions both pass a stale balance and overdraw the
+   * account. Returns false when the balance is insufficient, in which case
+   * nothing is written.
+   */
+  async reserveCredits(userId: string, runId: string, credits: number): Promise<boolean> {
+    return withTransaction(async (client) => {
+      const { rows } = await client.query<{ credits_total: number }>(
+        `SELECT credits_total FROM users WHERE id = $1 FOR UPDATE`,
+        [userId],
+      );
+      const allowance = rows[0]?.credits_total;
+      if (allowance === undefined) return false;
+
+      const { rows: pos } = await client.query<{ remaining: string }>(
+        `SELECT ($1 + COALESCE(SUM(delta), 0))::text AS remaining
+           FROM credit_ledger WHERE user_id = $2`,
+        [allowance, userId],
+      );
+      const remaining = Number(pos[0]?.remaining ?? 0);
+      if (remaining < credits) return false;
+
       await client.query(
         `INSERT INTO credit_ledger (user_id, delta, reason, run_id) VALUES ($1, $2, 'run', $3)`,
         [userId, -credits, runId],
       );
+      await client.query(`UPDATE runs SET credits_used = $2 WHERE id = $1`, [runId, credits]);
+      return true;
+    });
+  },
+
+  /**
+   * Settle a reservation against the tests that actually executed.
+   *
+   * `actual` can only be less than or equal to what was reserved (it is
+   * computed from a subset of the submitted configs), so the normal path writes
+   * a refund. The idempotency comes from the partial unique index on
+   * `(run_id) WHERE reason = 'run'`: the original reservation row is found by
+   * that key, and a second settlement for the same run is a no-op.
+   */
+  async settleCredits(runId: string, userId: string, actual: number): Promise<number> {
+    return withTransaction(async (client) => {
+      const { rows } = await client.query<{ delta: number }>(
+        `SELECT delta FROM credit_ledger
+          WHERE run_id = $1 AND reason = 'run'
+          FOR UPDATE`,
+        [runId],
+      );
+      const reservation = rows[0]?.delta;
+      if (reservation === undefined) {
+        // No reservation exists (a run created before this migration, or one
+        // that reached settlement without going through submit). Charge the
+        // actual amount instead of silently running for free.
+        if (actual > 0) {
+          await client.query(
+            `INSERT INTO credit_ledger (user_id, delta, reason, run_id)
+             VALUES ($1, $2, 'run', $3)
+             ON CONFLICT DO NOTHING`,
+            [userId, -actual, runId],
+          );
+          await client.query(`UPDATE runs SET credits_used = $2 WHERE id = $1`, [runId, actual]);
+        } else {
+          await client.query(`UPDATE runs SET credits_used = 0 WHERE id = $1`, [runId]);
+        }
+        return actual;
+      }
+
+      const reserved = Math.abs(reservation);
+      const refund = reserved - actual;
+      if (refund > 0) {
+        await client.query(
+          `INSERT INTO credit_ledger (user_id, delta, reason, run_id) VALUES ($1, $2, 'run_refund', $3)`,
+          [userId, refund, runId],
+        );
+      } else if (refund < 0) {
+        // Should not happen; if it ever does, record the extra honestly rather
+        // than letting the ledger disagree with the run.
+        await client.query(
+          `INSERT INTO credit_ledger (user_id, delta, reason, run_id) VALUES ($1, $2, 'run_extra', $3)`,
+          [userId, refund, runId],
+        );
+      }
+      await client.query(`UPDATE runs SET credits_used = $2 WHERE id = $1`, [runId, actual]);
+      return actual;
+    });
+  },
+
+  /**
+   * Release a reservation because the run never executed.
+   *
+   * Reversal is an explicit compensating ledger row rather than a DELETE: the
+   * ledger is an audit trail, and an entry that vanishes leaves no evidence
+   * that a hold was ever placed. Safe to call twice — a run with no reservation
+   * refunds nothing.
+   */
+  async refundCredits(runId: string, userId: string): Promise<number> {
+    return withTransaction(async (client) => {
+      const { rows } = await client.query<{ delta: number }>(
+        `SELECT delta FROM credit_ledger
+          WHERE run_id = $1 AND reason = 'run'
+          FOR UPDATE`,
+        [runId],
+      );
+      const reservation = rows[0]?.delta;
+      if (reservation === undefined) return 0;
+
+      const { rows: prior } = await client.query<{ total: string }>(
+        `SELECT COALESCE(SUM(delta), 0)::text AS total FROM credit_ledger
+          WHERE run_id = $1 AND reason IN ('run_refund', 'run_extra')`,
+        [runId],
+      );
+      // Only the part of the reservation that is still held is released.
+      const releasedSoFar = Number(prior[0]?.total ?? 0);
+      const held = Math.max(0, Math.abs(reservation) - releasedSoFar);
+      if (held === 0) return 0;
+
+      await client.query(
+        `INSERT INTO credit_ledger (user_id, delta, reason, run_id) VALUES ($1, $2, 'run_refund', $3)`,
+        [userId, held, runId],
+      );
+      await client.query(`UPDATE runs SET credits_used = 0 WHERE id = $1`, [runId]);
+      return held;
     });
   },
 };
@@ -708,18 +840,96 @@ export interface CreditRequest {
   requestedAt: string;
 }
 
+export interface CreditRequestRecord extends CreditRequest {
+  email: string;
+  displayName: string;
+  note: string | null;
+  resolvedAt: string | null;
+}
+
 /**
- * Raise a credit request. The reference UI states the admin receives an email;
- * this records the request and (when SMTP is configured) notifies, otherwise it
- * is visible to admins through the API.
+ * Raise a top-up request.
+ *
+ * Recorded in its own table rather than as a `delta = 0` marker row in the
+ * ledger: a request is not a balance movement, and a zero-delta row in an
+ * accounting table is indistinguishable from a rounding artefact when someone
+ * later reconciles the numbers.
  */
-export async function requestCredits(user: UserAccount): Promise<CreditRequest> {
+export async function requestCredits(user: UserAccount, note?: string): Promise<CreditRequest> {
   const id = randomUUID();
-  await query(
-    `INSERT INTO credit_ledger (user_id, delta, reason) VALUES ($1, 0, $2)`,
-    [user.id, `credit-request:${id}`],
+  const { rows } = await query<{ requested_at: Date }>(
+    `INSERT INTO credit_requests (id, user_id, note) VALUES ($1, $2, $3) RETURNING requested_at`,
+    [id, user.id, note?.slice(0, 500) ?? null],
   );
-  return { id, userId: user.id, requestedAt: new Date().toISOString() };
+  return {
+    id,
+    userId: user.id,
+    requestedAt: (rows[0]?.requested_at ?? new Date()).toISOString(),
+  };
+}
+
+/** Top-up requests, newest first. Pending first, then recently resolved. */
+export async function listCreditRequests(includeResolved = false): Promise<CreditRequestRecord[]> {
+  const { rows } = await query<{
+    id: string;
+    user_id: string;
+    email: string;
+    display_name: string;
+    note: string | null;
+    requested_at: Date;
+    resolved_at: Date | null;
+  }>(
+    `SELECT r.id, r.user_id, u.email, u.display_name, r.note, r.requested_at, r.resolved_at
+       FROM credit_requests r
+       JOIN users u ON u.id = r.user_id
+      WHERE ($1::boolean OR r.resolved_at IS NULL)
+      ORDER BY (r.resolved_at IS NOT NULL), r.requested_at DESC
+      LIMIT 200`,
+    [includeResolved],
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    userId: row.user_id,
+    email: row.email,
+    displayName: row.display_name,
+    note: row.note,
+    requestedAt: row.requested_at.toISOString(),
+    resolvedAt: row.resolved_at ? row.resolved_at.toISOString() : null,
+  }));
+}
+
+/**
+ * Grant credits to an account.
+ *
+ * This is the other half of the top-up flow: without it, "an administrator will
+ * approve your request" had no implementation — there was no endpoint anywhere
+ * that could add credits to a user.
+ */
+export async function grantCredits(
+  userId: string,
+  credits: number,
+  adminId: string,
+  reason = 'admin-grant',
+): Promise<number> {
+  if (!Number.isFinite(credits) || credits === 0) return 0;
+  const amount = Math.trunc(credits);
+  await withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO credit_ledger (user_id, delta, reason) VALUES ($1, $2, $3)`,
+      [userId, amount, `${reason}:${adminId}`],
+    );
+  });
+  return amount;
+}
+
+/** Mark every pending request for a user as answered by this admin. */
+export async function resolveCreditRequests(userId: string, adminId: string): Promise<number> {
+  const { rowCount } = await query(
+    `UPDATE credit_requests SET resolved_at = now(), resolved_by = $2
+      WHERE user_id = $1 AND resolved_at IS NULL`,
+    [userId, adminId],
+  );
+  return rowCount ?? 0;
 }
 
 /* ------------------------------------------------------------------ *

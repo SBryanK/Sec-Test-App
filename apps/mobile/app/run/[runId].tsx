@@ -1,11 +1,27 @@
+/**
+ * Live run progress.
+ *
+ * Status resolution is the subtle part: the SSE stream is an accelerator and
+ * polling is authoritative, so the displayed status prefers whichever source
+ * has reached a terminal state. Taking the stream's value first would strand
+ * the screen on "Running" forever if the stream dropped mid-run — the header
+ * is hidden and this route disables the back gesture, so that is a trap with
+ * no way out.
+ *
+ * `require-atomic-updates` is disabled file-wide: it flags the standard
+ * "check a flag, set it, await, clear it in finally" polling guard as a race.
+ * It is not one here — JavaScript is single-threaded and the flag is set
+ * synchronously before the first await.
+ */
+/* eslint-disable require-atomic-updates */
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import React, { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Alert, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import type { RunProgress, RunRecord } from '@teo/shared';
+import type { RunProgress, RunRecord, RunStatus } from '@teo/shared';
 import { getTest } from '@teo/shared';
 
 import { api, streamRun } from '../../src/api/client';
@@ -28,29 +44,53 @@ export default function RunScreen(): React.JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const doneRef = useRef(false);
+  /** Guards against overlapping polls on a slow link. */
+  const inFlightRef = useRef(false);
+
+  // A new run id means a fresh screen state; without this, a reused instance
+  // would never poll or detect completion again.
+  useEffect(() => {
+    doneRef.current = false;
+    setProgress(null);
+    setRun(null);
+    setError(null);
+  }, [runId]);
 
   // Initial fetch + polling fallback for when SSE is unavailable.
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setInterval> | null = null;
 
+    const settle = (): void => {
+      if (timer) clearInterval(timer);
+      void Haptics.notificationAsync(
+        run?.status === 'cancelled'
+          ? Haptics.NotificationFeedbackType.Warning
+          : Haptics.NotificationFeedbackType.Success,
+      );
+      void refresh();
+    };
+
     const load = async (): Promise<void> => {
+      // Guard against overlapping polls: on a slow link a stale 'running'
+      // response could otherwise land after the terminal one.
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
       try {
         const data = await api.getRun(runId);
         if (cancelled) return;
         setRun(data.run);
+        // Clear a transient poll failure once a fetch succeeds, rather than
+        // pinning a red banner for the rest of the run.
+        setError(null);
         if (TERMINAL.has(data.run.status) && !doneRef.current) {
           doneRef.current = true;
-          if (timer) clearInterval(timer);
-          void Haptics.notificationAsync(
-            data.run.status === 'success'
-              ? Haptics.NotificationFeedbackType.Success
-              : Haptics.NotificationFeedbackType.Warning,
-          );
-          void refresh();
+          settle();
         }
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : t('common.error'));
+      } finally {
+        inFlightRef.current = false;
       }
     };
 
@@ -63,27 +103,44 @@ export default function RunScreen(): React.JSX.Element {
       cancelled = true;
       if (timer) clearInterval(timer);
     };
-  }, [runId, refresh, t]);
+  }, [runId, refresh, t, run?.status]);
 
-  // Live progress stream.
+  // Live progress stream. Purely an accelerator: polling above is authoritative.
   useEffect(() => {
     const stop = streamRun(runId, {
       onProgress: (p) => {
         setProgress(p);
         if (TERMINAL.has(p.status) && !doneRef.current) {
           doneRef.current = true;
-          void api.getRun(runId).then((d) => setRun(d.run)).catch(() => undefined);
+          void api
+            .getRun(runId)
+            .then((d) => setRun(d.run))
+            .catch(() => undefined);
           void refresh();
         }
       },
       onError: () => {
-        /* the polling fallback above covers this */
+        // The stream died. Polling keeps the screen correct, so a dropped SSE
+        // connection must not strand the UI — which is why the status below
+        // prefers a terminal value from either source.
       },
     });
     return stop;
   }, [runId, refresh]);
 
-  const status = progress?.status ?? run?.status ?? 'queued';
+  /**
+   * Prefer whichever source has reached a terminal state.
+   *
+   * Taking `progress.status` first meant a stream that dropped mid-run left
+   * `progress` pinned at 'running' forever: polling would fetch the real
+   * 'success' record and stop, but the screen kept spinning with no way out —
+   * the header is hidden and the route disables the back gesture.
+   */
+  const status: RunStatus = TERMINAL.has(progress?.status ?? 'queued')
+    ? (progress?.status as RunStatus)
+    : run && TERMINAL.has(run.status)
+      ? run.status
+      : (progress?.status ?? run?.status ?? 'queued');
   const finished = TERMINAL.has(status);
 
   const cancel = (): void => {
